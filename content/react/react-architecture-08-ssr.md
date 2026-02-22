@@ -1,912 +1,166 @@
-# React 18 SSR 아키텍처: Fizz, RSC, 그리고 Next.js App Router
+---
+title: "React 18이 SSR을 완전히 다시 설계한 이유 — Fizz, Flight, 그리고 스트리밍의 철학"
+date: "2025-02-20"
+tags: [React, SSR, Server Components, Streaming, Architecture]
+series: "React 아키텍처 심층 분석"
+---
 
-> 시리즈: React 아키텍처 심층 분석 - 8편
-> 분석 대상: React 18.3.1, Next.js 14.2.35
-> 소스 경로: `node_modules/.pnpm/react-dom@18.3.1/node_modules/react-dom/cjs/`
+React 18이 출시되었을 때, 많은 개발자들은 Concurrent Mode, Suspense 개선, `startTransition` 같은 클라이언트 사이드 기능들에 주목했습니다. 그러나 조용하지만 훨씬 근본적인 변화가 서버 쪽에서 일어나고 있었습니다. React는 서버사이드 렌더링 시스템을 단순히 업그레이드한 것이 아니라, **처음부터 다시 설계**했습니다. 이 글은 그 이유를 탐구합니다.
 
 ---
 
-## 들어가며
+## 오래된 계약의 균열
 
-React 18의 SSR은 단순한 업그레이드가 아닌 아키텍처의 전면 교체입니다. 기존 `renderToString`이 동기적 단일 패스로 HTML을 생성하던 방식에서, **Fizz**라는 완전히 새로운 스트리밍 렌더러로 대체되었습니다. 여기에 Server Components가 더해지면서 서버 렌더링의 패러다임 자체가 바뀌었습니다.
+웹 초창기부터 서버사이드 렌더링의 철학은 단순했습니다. 서버가 완전한 HTML을 만들어 브라우저에 보내고, 브라우저는 그것을 받아 화면에 그린다. React의 초기 SSR API인 `renderToString`은 이 철학을 충실하게 구현했습니다.
 
-이 글에서는 실제 소스 코드를 추적하며 다음 네 가지 주제를 깊이 탐구합니다:
+문제는 이 모델이 단일 전제 위에 세워져 있다는 것입니다. **"HTML을 전송하기 전에 모든 데이터가 준비되어 있어야 한다."** 페이지에 느린 데이터베이스 쿼리 하나가 있다면, 그것이 끝날 때까지 브라우저는 빈 화면을 보게 됩니다. 빠른 API가 열 개 있어도, 느린 API 하나가 전체 응답을 인질로 잡습니다.
 
-1. 레거시 SSR vs 현대 Fizz 비교
-2. 스트리밍 SSR의 설계 원리
-3. Server Components 아키텍처 철학
-4. React 18 SSR의 미래 방향성 (PPR, use cache)
+비유하자면, `renderToString`은 레스토랑에서 모든 요리를 완성한 뒤에야 첫 번째 접시를 테이블로 보내는 주방과 같습니다. 손님은 배고프게 기다리다가, 모든 음식이 한꺼번에 도착하는 경험을 합니다. 이것이 서비스의 정석처럼 보일 수 있지만, 현대 웹의 사용자 경험과는 거리가 멉니다.
 
----
-
-## 1. 레거시 SSR vs 현대 Fizz 비교
-
-### 1.1 renderToString의 실체
-
-`renderToString`은 React 초기부터 존재하던 API입니다. 그런데 React 18에서 이 함수의 구현을 들여다보면 놀라운 사실이 있습니다. 이미 Fizz 위에서 동작합니다.
-
-```javascript
-// react-dom-server-legacy.node.development.js, line 6964
-function renderToStringImpl(children, options, generateStaticMarkup, abortReason) {
-  var result = '';
-  var destination = {
-    push: function (chunk) {
-      if (chunk !== null) {
-        result += chunk;  // 문자열에 직접 누적
-      }
-      return true;
-    },
-    destroy: function (error) {
-      didFatal = true;
-      fatalError = error;
-    }
-  };
-
-  var readyToStream = false;
-  function onShellReady() {
-    readyToStream = true;
-  }
-
-  var request = createRequest(
-    children,
-    createResponseState$1(generateStaticMarkup, ...),
-    createRootFormatContext(),
-    Infinity,        // progressiveChunkSize: 제한 없음
-    onError,
-    undefined,       // onAllReady: 없음
-    onShellReady,    // Shell 완성 시 플래그만 세움
-    undefined,
-    undefined
-  );
-
-  startWork(request);
-  abort(request, abortReason); // 즉시 중단 요청 (Suspense 처리 불가)
-  startFlowing(request, destination);
-
-  return result;
-}
-```
-
-핵심을 보면:
-- `progressiveChunkSize`를 `Infinity`로 설정해 청킹 없이 전체를 한 번에 처리
-- `abort()`를 즉시 호출해 Suspense를 강제로 클라이언트 렌더링으로 전환
-- 결과를 문자열로 누적 (`result += chunk`)
-
-```javascript
-// line 7079
-function renderToString(children, options) {
-  return renderToStringImpl(children, options, false,
-    'The server used "renderToString" which does not support Suspense. ' +
-    'If you intended to have the server wait for the suspended component ' +
-    'please switch to "renderToPipeableStream"'
-  );
-}
-```
-
-에러 메시지 자체가 이 API의 한계를 명확히 설명합니다. `renderToString`은 이제 레거시 호환성을 위한 폴백이지, 권장 API가 아닙니다.
-
-### 1.2 왜 Fizz는 Fiber 트리를 사용하지 않는가
-
-가장 중요한 설계 결정입니다. Fizz는 클라이언트의 Fiber reconciler와 **완전히 독립된** 렌더 시스템입니다.
-
-**Fiber가 SSR에 부적합한 이유:**
-
-| 측면 | Fiber | Fizz |
-|------|-------|------|
-| 자료구조 | 트리 노드 (linked list) | Task + Segment (배열 기반) |
-| 메모리 | 컴포넌트당 Fiber 객체 생성 | 청크 버퍼에 직접 쓰기 |
-| 상태 | work-in-progress 더블 버퍼링 | 단방향 진행 (이전 상태 불필요) |
-| 목적 | 인터렉티브 업데이트, 증분 렌더링 | 스트림 생성, 일회성 출력 |
-| 스케줄링 | Lane 기반 우선순위 | Task 큐 + pingTask |
-
-```javascript
-// react-dom-server.node.development.js, line 5467
-function createTask(request, node, blockedBoundary, blockedSegment,
-                    abortSet, legacyContext, context, treeContext) {
-  request.allPendingTasks++;
-
-  if (blockedBoundary === null) {
-    request.pendingRootTasks++;  // Shell에 속하는 Task
-  } else {
-    blockedBoundary.pendingTasks++;  // 특정 Suspense Boundary에 속하는 Task
-  }
-
-  var task = {
-    node: node,                    // 렌더링할 React Element
-    ping: function () {
-      return pingTask(request, task); // Suspense resolve 시 호출
-    },
-    blockedBoundary: blockedBoundary, // 어떤 SuspenseBoundary를 블로킹 중인가
-    blockedSegment: blockedSegment,   // 어느 Segment에 출력할 것인가
-    abortSet: abortSet,
-    legacyContext: legacyContext,
-    context: context,
-    treeContext: treeContext
-  };
-
-  abortSet.add(task);
-  return task;
-}
-```
-
-```javascript
-// Segment 구조, line 5496
-function createPendingSegment(request, index, boundary, formatContext,
-                               lastPushedText, textEmbedded) {
-  return {
-    status: PENDING,
-    id: -1,           // 나중에 할당 (placeholder ID)
-    index: index,
-    parentFlushed: false,
-    chunks: [],       // 실제 HTML 청크 버퍼
-    children: [],     // 자식 Segment 참조
-    formatContext: formatContext,
-    boundary: boundary,
-    lastPushedText: lastPushedText,
-    textEmbedded: textEmbedded
-  };
-}
-```
-
-**Fizz의 핵심 통찰:** 서버에서는 이전 상태로 되돌아갈 일이 없습니다. 한 번 HTML을 생성하면 그걸로 끝입니다. Fiber의 더블 버퍼링, work-in-progress 트리, Lane 스케줄링은 서버에서 모두 오버헤드입니다.
-
-### 1.3 Fizz 렌더 루프: performWork
-
-```javascript
-// line 6629
-function performWork(request) {
-  if (request.status === CLOSED) {
-    return;
-  }
-
-  var prevDispatcher = ReactCurrentDispatcher$1.current;
-  ReactCurrentDispatcher$1.current = Dispatcher; // SSR 전용 Dispatcher
-
-  try {
-    var pingedTasks = request.pingedTasks;
-    var i;
-
-    // ping된 Task를 순서대로 처리
-    for (i = 0; i < pingedTasks.length; i++) {
-      var task = pingedTasks[i];
-      retryTask(request, task);
-    }
-    pingedTasks.splice(0, i); // 처리 완료된 Task 제거
-
-    if (request.destination !== null) {
-      flushCompletedQueues(request, request.destination); // 완성된 청크 플러시
-    }
-  } finally {
-    ReactCurrentDispatcher$1.current = prevDispatcher;
-  }
-}
-```
-
-이 렌더 루프는 의도적으로 단순합니다. `pingedTasks` 배열에서 Task를 꺼내 처리하고, 완성된 청크를 destination에 씁니다. Fiber의 workLoop처럼 복잡한 Lanes 계산이나 work stealing이 없습니다.
+React 팀은 이 근본적인 제약이 API 설계 문제가 아니라 **아키텍처 문제**라는 것을 깨달았습니다. `renderToString`을 아무리 개선해도 동기적 단일 패스라는 본질을 벗어날 수 없었습니다.
 
 ---
 
-## 2. 스트리밍 SSR의 설계 원리
+## Fizz — 서버를 위해 다시 태어난 렌더러
 
-### 2.1 Request 객체: Fizz의 핵심 상태
+React 18의 해답은 **Fizz**입니다. Fizz는 기존 렌더러를 개선한 것이 아니라, 서버의 특성을 처음부터 고려해 설계된 완전히 새로운 렌더 시스템입니다.
 
-```javascript
-// line 5408
-function createRequest(children, responseState, rootFormatContext,
-                        progressiveChunkSize, onError, onAllReady,
-                        onShellReady, onShellError, onFatalError) {
-  var pingedTasks = [];
-  var abortSet = new Set();
+Fizz를 이해하려면 먼저 React의 기존 렌더러인 **Fiber**가 왜 서버에 부적합한지 이해해야 합니다. Fiber는 클라이언트의 인터랙티브한 특성에 최적화되어 있습니다. 사용자가 버튼을 클릭하면 이전 상태로 되돌아갈 수도 있고, 높은 우선순위의 업데이트가 낮은 우선순위 작업을 중단시킬 수도 있습니다. 이를 위해 Fiber는 더블 버퍼링을 사용합니다. 현재 화면에 표시된 트리와, 작업 중인 새 트리를 동시에 유지하는 것입니다. Lane이라는 비트마스크 시스템으로 업데이트 우선순위를 정교하게 관리하기도 합니다.
 
-  var request = {
-    destination: null,           // 현재 연결된 스트림
-    status: OPEN,
-    nextSegmentId: 0,            // Segment ID 카운터
-    allPendingTasks: 0,          // 전체 미완료 Task 수
-    pendingRootTasks: 0,         // Shell에 속한 미완료 Task 수
-    completedRootSegment: null,  // 완성된 루트 Segment
-    abortableTasks: abortSet,
-    pingedTasks: pingedTasks,
-    clientRenderedBoundaries: [], // 클라이언트로 위임된 경계들
-    completedBoundaries: [],      // 완성된 Suspense 경계들
-    partialBoundaries: [],
-    onError: onError,
-    onAllReady: onAllReady,       // 모든 Task 완료 시
-    onShellReady: onShellReady,   // Shell Task 완료 시
-    onShellError: onShellError,
-    onFatalError: onFatalError
-  };
+서버에는 이 모든 것이 필요하지 않습니다. HTML을 한 번 생성하면 그걸로 끝입니다. 이전 상태로 되돌아갈 일도, 우선순위 선점을 고려할 상호작용도 없습니다. 클라이언트를 위해 존재하는 Fiber의 정교한 기계들은 서버에서 순수한 오버헤드가 됩니다.
 
-  var rootSegment = createPendingSegment(request, 0, null, rootFormatContext, false, false);
-  rootSegment.parentFlushed = true; // 루트는 항상 flush 가능
+Fizz는 이 통찰을 바탕으로 훨씬 단순한 자료구조를 선택했습니다. **Task**와 **Segment**입니다. Task는 렌더링해야 할 작업 단위이고, Segment는 생성된 HTML 청크를 담는 버퍼입니다. 트리 구조를 순회하며 linked list를 타고 다니는 대신, Fizz는 Task 큐에서 작업을 꺼내 처리하고 결과를 Segment에 씁니다. 단방향, 일회성, 최소주의. 서버 렌더링의 본질적인 요구사항만 남긴 설계입니다.
 
-  var rootTask = createTask(request, children, null, rootSegment, ...);
-  pingedTasks.push(rootTask);
-  return request;
-}
-```
-
-### 2.2 Shell과 Content의 분리
-
-Fizz의 가장 중요한 개념은 **Shell**과 **Content**의 분리입니다.
-
-**Shell**: Suspense 경계 바깥의 콘텐츠. 즉시 전송 가능하며, 이것이 준비되는 시점이 `onShellReady`입니다.
-
-**Content**: Suspense 경계 안의 콘텐츠. 비동기적으로 해결되며, 나중에 스트림에 주입됩니다.
-
-```javascript
-// finishedTask 함수 - onShellReady가 언제 호출되는지
-// line ~6490
-function finishedTask(request, boundary, segment) {
-  if (boundary === null) {
-    // boundary가 null이면 이 Task는 Shell에 속함
-    if (segment.parentFlushed) {
-      request.completedRootSegment = segment;
-    }
-
-    request.pendingRootTasks--;
-
-    if (request.pendingRootTasks === 0) {
-      // Shell을 구성하는 모든 Task가 완료됨
-      request.onShellError = noop$1; // Shell이 완성되면 더 이상 ShellError 없음
-      var onShellReady = request.onShellReady;
-      onShellReady(); // 여기서 pipe()를 호출해 스트리밍 시작
-    }
-  } else {
-    boundary.pendingTasks--;
-
-    if (boundary.pendingTasks === 0) {
-      // 특정 Suspense Boundary의 콘텐츠가 완성됨
-      // completedBoundaries에 추가 -> 나중에 flushCompletedQueues에서 전송
-    }
-  }
-
-  request.allPendingTasks--;
-  if (request.allPendingTasks === 0) {
-    var onAllReady = request.onAllReady;
-    onAllReady(); // 모든 Task 완료 (정적 생성에 적합)
-  }
-}
-```
-
-### 2.3 onShellReady vs onAllReady: 사용 철학
-
-```javascript
-// renderToPipeableStream 공개 API, line 7042
-function renderToPipeableStream(children, options) {
-  var request = createRequestImpl(children, options);
-  var hasStartedFlowing = false;
-  startWork(request);
-
-  return {
-    pipe: function (destination) {
-      if (hasStartedFlowing) {
-        throw new Error('React currently only supports piping to one writable stream.');
-      }
-      hasStartedFlowing = true;
-      startFlowing(request, destination);
-      destination.on('drain', createDrainHandler(destination, request));
-      destination.on('error', createAbortHandler(request, ...));
-      destination.on('close', createAbortHandler(request, ...));
-      return destination;
-    },
-    abort: function (reason) {
-      abort(request, reason);
-    }
-  };
-}
-```
-
-| 콜백 | 사용 시점 | 적합한 케이스 |
-|------|----------|--------------|
-| `onShellReady` | Shell이 완성되는 즉시 | SSR with 스트리밍, 빠른 TTFB 필요 |
-| `onAllReady` | 모든 콘텐츠 완성 후 | 정적 생성, 크롤러 대응, 비스트리밍 환경 |
-
-**스트리밍 사용 패턴:**
-```javascript
-// 권장: 스트리밍 SSR
-const { pipe, abort } = renderToPipeableStream(<App />, {
-  onShellReady() {
-    res.statusCode = 200;
-    pipe(res); // Shell 즉시 전송, Content는 이후에 스트리밍
-  },
-  onError(error) {
-    res.statusCode = 500;
-  }
-});
-
-// 정적 생성: 완전한 HTML이 필요할 때
-const { pipe } = renderToPipeableStream(<App />, {
-  onAllReady() {
-    pipe(writable); // 전체 완성 후 한 번에 전송
-  }
-});
-```
-
-### 2.4 Suspense Boundary 처리: renderSuspenseBoundary
-
-```javascript
-// line 5620 - Suspense를 만났을 때 Fizz의 동작
-function renderSuspenseBoundary(request, task, props) {
-  var parentBoundary = task.blockedBoundary;
-  var parentSegment = task.blockedSegment;
-
-  var newBoundary = createSuspenseBoundary(request, fallbackAbortSet);
-
-  // 핵심: 콘텐츠와 폴백을 위한 별도 Segment 생성
-  var boundarySegment = createPendingSegment(request, insertionIndex, newBoundary, ...);
-  parentSegment.children.push(boundarySegment);
-
-  var contentRootSegment = createPendingSegment(request, 0, null, ...);
-  contentRootSegment.parentFlushed = true;
-
-  // 현재 Task의 블로킹 대상을 임시 전환
-  task.blockedBoundary = newBoundary;
-  task.blockedSegment = contentRootSegment;
-
-  try {
-    // 콘텐츠 렌더링 시도
-    renderNode(request, task, content);
-    contentRootSegment.status = COMPLETED;
-
-    if (newBoundary.pendingTasks === 0) {
-      // 콘텐츠가 suspend 없이 완성됨 -> 폴백 불필요
-      return;
-    }
-  } catch (error) {
-    // 에러 발생 -> 클라이언트 렌더링으로 위임
-    contentRootSegment.status = ERRORED;
-    newBoundary.forceClientRender = true;
-  } finally {
-    // 블로킹 대상 복원
-    task.blockedBoundary = parentBoundary;
-    task.blockedSegment = parentSegment;
-  }
-
-  // 폴백을 위한 별도 Task 생성 (낮은 우선순위)
-  var suspendedFallbackTask = createTask(
-    request, fallback, parentBoundary, boundarySegment, ...
-  );
-  request.pingedTasks.push(suspendedFallbackTask);
-}
-```
-
-Suspense를 만나면:
-1. 콘텐츠 렌더 시도
-2. Suspend 발생 시 -> 폴백 Task를 큐에 추가, `<!--$?-->` placeholder 삽입
-3. 나중에 콘텐츠가 resolve되면 -> `$RS()` 스크립트로 DOM 교체
-
-```javascript
-// HTML에 삽입되는 완성 스크립트 (line 3344)
-var completeSegmentFunction =
-  'function $RS(a,b){' +
-    'a=document.getElementById(a);' +
-    'b=document.getElementById(b);' +
-    'for(a.parentNode.removeChild(a);a.firstChild;)' +
-      'b.parentNode.insertBefore(a.firstChild,b);' +
-    'b.parentNode.removeChild(b)' +
-  '}';
-```
-
-이 인라인 스크립트가 스트리밍 중에 클라이언트에서 지연 콘텐츠를 교체합니다.
-
-### 2.5 Selective Hydration과 Fizz의 상호작용
-
-Fizz가 만들어낸 HTML에는 Suspense 경계마다 특수 주석이 삽입됩니다:
-
-```html
-<!-- 완성된 Suspense -->
-<!--$-->
-<div>실제 콘텐츠</div>
-<!--/$-->
-
-<!-- 대기 중인 Suspense -->
-<!--$?-->
-<template id="B:0"></template>
-<div>폴백 UI</div>
-<!--/$-->
-
-<!-- 클라이언트 렌더링으로 위임된 Suspense -->
-<!--$!-->
-<template data-dgst="..." data-msg="..."></template>
-<!--/$-->
-```
-
-클라이언트의 Fiber reconciler는 이 주석들을 읽어 **Selective Hydration**을 수행합니다:
-
-```javascript
-// react-dom.development.js, line 6197
-// 사용자가 Suspense 경계를 클릭했을 때
-function attemptExplicitHydrationTarget(queuedTarget) {
-  var targetInst = getClosestInstanceFromNode(queuedTarget.target);
-  if (nearestMounted.tag === SuspenseComponent) {
-    var instance = getSuspenseInstanceFromFiber(nearestMounted);
-    if (instance !== null) {
-      // 이 경계의 hydration 우선순위를 높임
-      queuedTarget.blockedOn = instance;
-      attemptHydrationAtPriority(queuedTarget.priority, function () {
-        attemptHydrationAtCurrentPriority(nearestMounted);
-      });
-    }
-  }
-}
-
-// 우선순위 큐로 관리
-var queuedExplicitHydrationTargets = [];
-
-function queueExplicitHydrationTarget(target) {
-  var updatePriority = getCurrentUpdatePriority$1();
-  var queuedTarget = { blockedOn: null, target: target, priority: updatePriority };
-
-  // 우선순위 내림차순 삽입
-  for (; i < queuedExplicitHydrationTargets.length; i++) {
-    if (!isHigherEventPriority(updatePriority, queuedExplicitHydrationTargets[i].priority)) {
-      break;
-    }
-  }
-  queuedExplicitHydrationTargets.splice(i, 0, queuedTarget);
-}
-```
-
-**Selective Hydration의 동작:**
-- 모든 Suspense 경계를 한꺼번에 hydrate하지 않음
-- 사용자 상호작용(클릭, 포커스)이 발생한 경계를 우선 hydrate
-- 나머지는 idle 시간에 점진적으로 처리
+흥미로운 점은 `renderToString` 자체도 React 18에서는 Fizz 위에서 동작한다는 사실입니다. 하지만 Fizz의 능력을 의도적으로 봉인합니다. 청크 크기 제한을 무한대로 설정해 스트리밍이 일어나지 않도록 하고, Suspense를 만나면 즉시 중단 신호를 보내 비동기 처리 대신 클라이언트 렌더링으로 강제 전환합니다. `renderToString`의 에러 메시지가 이를 스스로 고백합니다. "이 API는 Suspense를 지원하지 않습니다. `renderToPipeableStream`으로 전환하세요." API가 자신의 한계를 문서화하는 드문 사례입니다.
 
 ---
 
-## 3. Server Components 아키텍처 철학
+## Shell과 Content — 스트리밍 SSR의 핵심 철학
 
-### 3.1 두 개의 렌더 파이프라인
+Fizz의 핵심 개념은 **Shell**과 **Content**의 분리입니다. 이것이 스트리밍 SSR의 모든 것을 설명합니다.
 
-Next.js App Router에서 페이지 요청 시 실제로는 두 개의 독립적인 렌더 파이프라인이 동시에 실행됩니다.
+Shell은 Suspense 경계 바깥에 있는 콘텐츠입니다. 네비게이션 바, 페이지 레이아웃, 사이드바처럼 즉시 렌더링 가능한 부분들입니다. Content는 Suspense 경계 안에 있는 콘텐츠입니다. 데이터 페칭이 완료되어야 렌더링 가능한 동적인 부분들입니다.
 
-```
-요청
- │
- ├── RSC 파이프라인 (React Flight)
- │    ComponentMod.renderToReadableStream(
- │      <ReactServerApp tree={loaderTree} />,
- │      clientReferenceManifest.clientModules
- │    )
- │    └─> RSC Payload (바이너리/텍스트 스트림)
- │         │
- │         ├─> [tee] ─> renderStream (SSR에 공급)
- │         └─> [tee] ─> dataStream (인라인 스크립트에 삽입)
- │
- └── SSR 파이프라인 (Fizz)
-      renderToPipeableStream(
-        <ReactServerEntrypoint
-          reactServerStream={renderStream}
-          clientReferenceManifest={...}
-        />,
-        { onShellReady: () => pipe(res) }
-      )
-      └─> HTML 스트림
-```
+Fizz는 Shell과 Content를 완전히 독립적인 작업으로 처리합니다. Shell이 준비되는 순간 브라우저로 전송을 시작합니다. 브라우저는 즉시 레이아웃을 그리고, 사용자에게 페이지가 존재함을 알립니다. 그 사이 서버에서는 각 Suspense 경계의 데이터를 비동기적으로 기다립니다. 데이터가 도착할 때마다, 해당 영역의 HTML이 스트림에 주입됩니다.
 
-```javascript
-// app-render.js, line 585
-const serverStream = ComponentMod.renderToReadableStream(
-  <ReactServerApp tree={tree} ctx={ctx} asNotFound={asNotFound} />,
-  clientReferenceManifest.clientModules,
-  { onError: serverComponentsErrorHandler }
-);
+이것이 파이프라인과 레스토랑 비유를 뒤집습니다. 이제 주방은 전채 요리가 완성되는 즉시 테이블로 보냅니다. 손님이 첫 번째 접시를 먹는 동안 두 번째 요리가 준비됩니다. 음식들이 순차적으로 도착하지만, 손님은 처음부터 무언가를 받았다는 경험을 합니다.
 
-// RSC 스트림을 두 갈래로 분기
-let [renderStream, dataStream] = serverStream.tee();
+기술적으로 이것이 어떻게 구현되는지가 흥미롭습니다. Fizz는 Suspense 경계를 만나면 콘텐츠 렌더링을 시도합니다. 비동기 작업이 있어 즉시 완성할 수 없다면, 그 자리에 placeholder를 삽입하고 폴백 UI를 렌더링하는 별도의 Task를 큐에 추가합니다. 나중에 비동기 작업이 완료되면, 브라우저가 실행할 수 있는 작은 인라인 스크립트와 함께 실제 콘텐츠가 스트림에 추가됩니다. 이 스크립트는 placeholder를 실제 콘텐츠로 교체하는 DOM 조작을 수행합니다. 전체 과정이 HTTP 연결 하나에서, 단방향 스트림으로 이루어집니다.
 
-const children = (
-  <ReactServerEntrypoint
-    reactServerStream={renderStream}      // SSR에서 React.use()로 소비
-    preinitScripts={preinitScripts}
-    clientReferenceManifest={clientReferenceManifest}
-    nonce={nonce}
-  />
-);
-```
+`renderToPipeableStream` API가 두 개의 콜백을 제공하는 것도 이 철학의 표현입니다. `onShellReady`는 Shell이 완성되는 즉시 호출됩니다. 여기서 `pipe()`를 호출하면 스트리밍이 시작됩니다. `onAllReady`는 모든 Suspense 경계가 해결된 후에 호출됩니다. 정적 사이트 생성처럼 완전한 HTML이 필요할 때 사용합니다. 하나의 API가 스트리밍과 비스트리밍 시나리오를 모두 지원하면서, 사용 철학은 콜백 선택에 담겨 있습니다.
 
-### 3.2 RSC Payload: 왜 HTML이 아닌가
+---
 
-Server Component가 HTML 대신 RSC Payload(React Flight 프로토콜)로 직렬화되는 이유는 **클라이언트 컴포넌트와의 합성(composition)**을 위해서입니다.
+## Selective Hydration — 상호작용의 민주화
 
-```javascript
-// use-flight-response.js, line 11
-export function useFlightStream(flightStream, clientReferenceManifest, nonce) {
-  const response = flightResponses.get(flightStream);
-  if (response) return response;
+스트리밍 HTML이 브라우저에 도착하면 또 다른 문제가 기다립니다. HTML은 정적입니다. React가 이벤트 리스너를 연결하고 상태를 초기화하는 hydration 과정이 필요합니다. 기존 방식에서는 hydration이 전체 트리를 한꺼번에 처리했습니다. 앱 전체가 hydrate되기 전까지는 어떤 부분도 인터랙티브하지 않았습니다.
 
-  // SSR 컨텍스트에서 RSC 스트림을 React 트리로 변환
-  const newResponse = createFromReadableStream(flightStream, {
-    ssrManifest: {
-      moduleLoading: clientReferenceManifest.moduleLoading,
-      moduleMap: clientReferenceManifest.ssrModuleMapping
-    }
-  });
+React 18의 **Selective Hydration**은 이 제약을 제거합니다. 각 Suspense 경계는 독립적으로 hydrate될 수 있습니다. 더 중요한 것은 사용자 상호작용이 hydration의 우선순위를 결정한다는 점입니다. 사용자가 아직 hydrate되지 않은 버튼을 클릭하면, React는 그 버튼이 속한 Suspense 경계의 hydration을 즉시 최우선 순위로 올립니다. 사용자의 의도가 시스템의 스케줄을 재조정하는 것입니다.
 
-  flightResponses.set(flightStream, newResponse);
-  return newResponse; // Promise-like 객체
-}
+이것이 가능한 이유는 Fizz가 생성한 HTML에 Suspense 경계마다 특수 주석이 포함되어 있기 때문입니다. 클라이언트의 Fiber reconciler는 이 주석들을 읽어 각 경계의 위치와 상태를 파악합니다. 대기 중인 경계, 완성된 경계, 클라이언트 렌더링으로 위임된 경계가 각각 다른 주석으로 표시됩니다. 이 메타데이터가 Selective Hydration의 기반입니다.
 
-// ReactServerEntrypoint (SSR 컨텍스트에서 실행)
-function ReactServerEntrypoint({ reactServerStream, ... }) {
-  preinitScripts();
-  const response = useFlightStream(reactServerStream, clientReferenceManifest, nonce);
-  return React.use(response); // RSC Payload를 React 트리로 언래핑
-}
-```
+---
 
-**RSC Payload가 필요한 이유:**
+## Server Components — 두 번째 혁명
 
-1. **Client Component 경계 처리**: HTML은 컴포넌트 경계를 표현할 수 없습니다. RSC Payload는 `"use client"` 컴포넌트를 만나면 해당 컴포넌트의 참조와 props만 직렬화하고, 실제 렌더링은 클라이언트로 위임합니다.
+스트리밍 SSR이 서버에서 HTML을 만드는 방식을 바꿨다면, **Server Components**는 무엇을 서버에서 실행하는지를 바꿉니다.
 
-2. **네비게이션 시 재사용**: 클라이언트 사이드 네비게이션 시 HTML 전체를 다시 받지 않아도 됩니다. RSC Payload만 받아서 React 트리를 업데이트합니다.
+기존의 SSR 컴포넌트는 서버에서 렌더링되지만, 그 코드는 클라이언트 번들에도 포함됩니다. 클라이언트가 hydration을 위해 같은 컴포넌트를 다시 실행해야 하기 때문입니다. 즉, 서버에서 렌더링하는 비용과 클라이언트에서 실행되는 번들 크기 비용을 모두 지불합니다.
 
-3. **컴포넌트 상태 보존**: Client Component의 로컬 상태를 유지하면서 Server Component만 업데이트할 수 있습니다.
+Server Components는 다르게 작동합니다. 서버에서만 실행되고, 클라이언트 번들에는 전혀 포함되지 않습니다. 데이터베이스 직접 접근, 파일 시스템 읽기, 크기 큰 라이브러리 사용이 번들 비용 없이 가능합니다. `marked`, `gray-matter`, `date-fns` 같은 수백 킬로바이트의 라이브러리를 서버에서 마음껏 사용해도, 클라이언트는 그 코드를 한 줄도 받지 않습니다.
 
-### 3.3 RSC Flight 프로토콜: Wire Format
+이것이 가능한 이유는 Server Component의 렌더링 결과가 HTML이 아닌 **RSC Payload**라는 특수한 형식으로 직렬화되기 때문입니다.
 
-Flight 프로토콜의 각 행은 다음 형식을 따릅니다:
+---
+
+## RSC Payload — 왜 HTML이 아닌가
+
+이것이 많은 개발자들이 갖는 자연스러운 질문입니다. 서버에서 이미 렌더링하는데, 왜 바로 HTML을 만들지 않을까요?
+
+HTML의 근본적인 한계는 컴포넌트 경계를 표현할 수 없다는 것입니다. HTML은 `<div>`, `<span>`, `<button>` 같은 요소들의 트리입니다. React 컴포넌트가 어디서 시작하고 어디서 끝나는지, 어떤 props를 받았는지, 어떤 컴포넌트가 어떤 컴포넌트를 렌더링했는지의 정보가 없습니다.
+
+이 정보가 없으면 세 가지 핵심 기능이 불가능해집니다.
+
+첫째, **Client Component 경계 처리**입니다. Server Component 트리 안에 `"use client"`로 표시된 클라이언트 컴포넌트가 있다면, 그 컴포넌트는 서버에서 실행할 수 없습니다. HTML로 렌더링했다면 이 경계를 표현할 방법이 없습니다. RSC Payload는 이 위치에 "여기에 이 모듈의 이 컴포넌트를 이 props로 렌더링하라"는 참조를 삽입합니다. 클라이언트는 이 참조를 받아 해당 모듈을 로드하고 렌더링합니다.
+
+둘째, **클라이언트 사이드 네비게이션 최적화**입니다. 사용자가 다른 페이지로 이동할 때, 전체 HTML을 다시 받지 않아도 됩니다. 변경된 부분의 RSC Payload만 받아 React 트리를 업데이트합니다. Client Component의 로컬 상태는 그대로 유지됩니다. 예를 들어, 쇼핑카트 아이콘의 열림/닫힘 상태는 페이지 이동 후에도 보존됩니다.
+
+셋째, **컴포넌트 상태 보존**입니다. Server Component가 업데이트될 때, 같은 페이지의 Client Component가 가진 로컬 상태를 파괴하지 않습니다. HTML 전체를 교체하면 React가 모든 상태를 잃지만, RSC Payload로 업데이트하면 React의 reconciliation이 변경된 부분만 업데이트합니다.
+
+RSC Payload는 **React Flight 프로토콜**이라는 텍스트 기반 형식을 사용합니다. 각 행은 ID, 타입, 데이터로 구성됩니다. React 요소, 클라이언트 컴포넌트 참조, 리소스 프리로드 힌트, 에러 정보가 각각 다른 타입으로 인코딩됩니다. 이 형식은 스트리밍에 친화적입니다. 행 단위로 파싱할 수 있으므로, 전체 Payload가 도착하기 전에 처리를 시작할 수 있습니다.
 
 ```
-<id_hex>:<tag><json_data>\n
-```
-
-```javascript
-// react-server-dom-turbopack-server.edge.production.js
-
-function serializeRowHeader(tag, id) {
-  return id.toString(16) + ':' + tag;  // 예: "0:I", "1:E", "2:H"
-}
-
-// 각 행 타입
-function emitImportChunk(request, id, clientReferenceMetadata) {
-  const row = serializeRowHeader('I', id) + json + '\n';
-  // "0:I{"id":"./Button.js#default","chunks":["app/Button.js"],...}\n"
-}
-
-function emitErrorChunk(request, id, digest, error) {
-  const row = serializeRowHeader('E', id) + stringify(errorInfo) + '\n';
-  // "1:E{"digest":"abc123"}\n"
-}
-
-function emitHintChunk(request, code, model) {
-  const row = serializeRowHeader('H' + code, id) + json + '\n';
-  // "2:HL["/_next/static/css/main.css","style"]\n"  (preload hint)
-}
-
-function emitModelChunk(request, id, json) {
-  const row = id.toString(16) + ':' + json + '\n';
-  // "3:["$","div",null,{"children":"Hello"}]\n"  (React element)
-}
-```
-
-실제 RSC Payload 예시:
-```
-0:I{"id":"./app/Button.js","chunks":["app/Button"],"name":"default","async":false}
+0:I{"id":"./app/Button.js","chunks":["app/Button"],"name":"default"}
 1:HL["/_next/static/css/main.css","style"]
 2:["$","$L0",null,{"children":"Click me"}]
 3:["$","div",null,{"className":"container","children":"$2"}]
 ```
 
-- `I` (Import): 클라이언트 컴포넌트 참조
-- `HL` (Hint Link): 리소스 프리로드 힌트
-- 숫자만: React element 모델
-
-### 3.4 Client Reference 처리: "use client" 경계
-
-```javascript
-// react-server-dom-turbopack-server.edge.production.js
-
-function isClientReference(reference) {
-  return reference.$$typeof === CLIENT_REFERENCE_TAG$1;
-}
-
-function registerClientReference(proxyImplementation, id, exportName) {
-  return registerClientReferenceImpl(proxyImplementation, id + '#' + exportName, false);
-}
-
-function registerClientReferenceImpl(proxyImplementation, id, async) {
-  return Object.defineProperties(proxyImplementation, {
-    $$typeof: { value: CLIENT_REFERENCE_TAG },
-    $$id: { value: id },
-    $$async: { value: async }
-  });
-}
-
-// 직렬화 시 클라이언트 참조를 만나면
-function serializeClientReference(request, parent, parentPropertyName, clientReference) {
-  const clientReferenceKey = getClientReferenceKey(clientReference);
-  const existingId = writtenClientReferences.get(clientReferenceKey);
-
-  if (existingId !== undefined) {
-    // 이미 기록된 경우 참조만 반환
-    return serializeByValueID(existingId);
-  }
-
-  // 새 Import 청크 생성
-  const metadata = resolveClientReferenceMetadata(config, clientReference);
-  emitImportChunk(request, importId, metadata);
-  writtenClientReferences.set(clientReferenceKey, importId);
-  return serializeByValueID(importId);
-}
-```
-
-**"use client" 처리 흐름:**
-```
-Server Component 트리 순회 중
-  Button 컴포넌트 발견 ("use client" 표시됨)
-  └-> isClientReference(Button) === true
-      └-> serializeClientReference() 호출
-          └-> emitImportChunk: "0:I{"id":"Button.js#default",...}"
-          └-> 이 위치에 "$L0" 참조 삽입 (lazy client component)
-              └-> 클라이언트에서 해당 모듈 로드 후 렌더링
-```
-
-### 3.5 Zero-bundle-size의 실제 구현
-
-Zero-bundle-size란 Server Component의 코드가 클라이언트 번들에 포함되지 않는다는 것입니다. 이것이 가능한 이유:
-
-```javascript
-// RSC 렌더링은 서버에서만 실행
-async function ProductPage({ id }) {
-  // 이 코드는 클라이언트 번들에 없음
-  const product = await db.query(`SELECT * FROM products WHERE id = ?`, [id]);
-  const markdown = await fs.readFile(`./content/${id}.md`, 'utf8');
-  const rendered = renderMarkdown(markdown);
-
-  return (
-    <div>
-      <h1>{product.name}</h1>
-      <div dangerouslySetInnerHTML={{ __html: rendered }} />
-      <AddToCartButton id={id} /> {/* "use client" - 이것만 번들에 포함 */}
-    </div>
-  );
-}
-```
-
-서버는 이 컴포넌트를 실행하고 결과를 RSC Payload로 직렬화합니다. 클라이언트는 payload만 받고, 실제 `ProductPage` 함수 코드는 전혀 알지 못합니다.
-
-### 3.6 RSC Payload의 클라이언트 인라인 삽입
-
-```javascript
-// use-flight-response.js, line 104
-function writeInitialInstructions(controller, scriptStart, formState) {
-  controller.enqueue(encoder.encode(
-    `${scriptStart}` +
-    `(self.__next_f=self.__next_f||[]).push(${JSON.stringify([0])});` +
-    `self.__next_f.push(${JSON.stringify([2, formState])})` +
-    `</script>`
-  ));
-}
-
-function writeFlightDataInstruction(controller, scriptStart, chunkAsString) {
-  controller.enqueue(encoder.encode(
-    `${scriptStart}self.__next_f.push(${JSON.stringify([1, chunkAsString])})</script>`
-  ));
-}
-```
-
-HTML에는 다음과 같이 삽입됩니다:
-
-```html
-<script>(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,null])</script>
-<!-- HTML 스트림 중간에 삽입되는 RSC Payload 청크 -->
-<script>self.__next_f.push([1,"0:I{\"id\":\"./Button.js\",...}\n"])</script>
-<script>self.__next_f.push([1,"3:[\"$\",\"div\",null,...]\n"])</script>
-```
-
-클라이언트 hydration 시 `self.__next_f`에 누적된 데이터를 읽어 RSC 트리를 복원합니다.
+이 네 줄이 하나의 페이지를 표현합니다. 첫 번째 줄은 클라이언트 컴포넌트 `Button`의 참조입니다. 두 번째 줄은 CSS 파일 프리로드 힌트입니다. 세 번째 줄은 `Button`을 렌더링하는 위치입니다. 네 번째 줄은 전체 레이아웃 구조입니다. 인간이 읽기는 어렵지만, 기계가 스트리밍으로 처리하기에 최적화된 형식입니다.
 
 ---
 
-## 4. React 18 SSR의 미래 방향성
+## 두 개의 파이프라인이 하나의 응답으로
 
-### 4.1 PPR (Partial Pre-rendering)
+Next.js App Router에서 페이지 요청이 들어오면, 실제로는 두 개의 독립적인 렌더 파이프라인이 동시에 실행됩니다. 이 설계를 이해하면 App Router의 동작 방식이 명확해집니다.
 
-PPR은 정적 Shell + 동적 콘텐츠를 하나의 HTML 응답으로 결합하는 기술입니다. React의 `unstable_postpone`를 활용합니다.
+첫 번째는 **RSC 파이프라인**입니다. Server Component 트리를 실행하고 RSC Payload를 생성합니다. 이 파이프라인은 React Flight를 사용하며, 결과는 스트림 형태입니다.
 
-```javascript
-// static-renderer.js, line 64
-export function createStaticRenderer({ ppr, isStaticGeneration, postponed, ... }) {
-  if (ppr) {
-    if (isStaticGeneration) {
-      // Phase 1: Prerender - 정적 부분만 렌더링
-      // dynamic() 컴포넌트는 postpone됨
-      return new StaticRenderer({
-        signal, onError, onPostpone, onHeaders, bootstrapScripts
-      });
-    } else {
-      if (postponed === DYNAMIC_DATA) {
-        // HTML이 완전히 정적이었음 -> 재렌더 불필요
-        return new VoidRenderer();
-      } else if (postponed) {
-        // Phase 2: Resume - 동적 부분만 렌더링
-        const reactPostponedState = postponed[1];
-        return new StaticResumeRenderer(reactPostponedState, {
-          signal, onError, onPostpone, nonce
-        });
-      }
-    }
-  }
-  // PPR 없음 -> 일반 렌더
-  return new ServerRenderer({ ... });
-}
-```
+두 번째는 **SSR 파이프라인**입니다. RSC Payload를 입력으로 받아 Fizz가 HTML을 생성합니다. 브라우저가 즉시 렌더링할 수 있는 HTML이 출력됩니다.
 
-**PPR의 렌더 흐름:**
-
-```
-Build Time (Phase 1 - Prerender):
-  전체 페이지 렌더 시도
-    └-> 동적 부분에서 React.postpone() 호출
-    └-> 정적 Shell 저장 (CDN 캐싱)
-    └-> postponed state 저장
-
-Request Time (Phase 2 - Resume):
-  저장된 Shell을 즉시 전송 (CDN에서)
-  동적 부분만 서버에서 렌더링
-    └-> postponed state 로드
-    └-> 동적 위치에 콘텐츠 스트리밍
-```
+핵심은 RSC 스트림이 두 갈래로 분기된다는 점입니다. 하나는 SSR에 공급되어 HTML 생성에 사용됩니다. 다른 하나는 HTML 안에 인라인 스크립트로 삽입됩니다. 브라우저가 HTML을 받는 동안 RSC Payload도 함께 받는 것입니다. hydration 시 React는 이 인라인 데이터를 사용해 서버와 클라이언트의 트리를 일치시킵니다.
 
 ```javascript
-// app-render.js - postponed 상태 처리
-const { stream, postponed, resumed } = await renderer.render(children);
-
-if (postponed != null) {
-  if (isStaticGeneration && usedDynamicData) {
-    // 동적 데이터 사용 + postpone -> DYNAMIC_DATA 상태로 저장
-    metadata.postponed = JSON.stringify(getDynamicDataPostponedState());
-  } else {
-    // HTML holes가 있는 상태 -> postponed HTML 저장
-    metadata.postponed = JSON.stringify(getDynamicHTMLPostponedState(postponed));
-  }
-}
+// RSC 스트림을 두 용도로 분기
+let [renderStream, dataStream] = serverStream.tee();
 ```
 
-### 4.2 "use cache" 디렉티브 (React 19 방향)
+이 한 줄이 아키텍처의 핵심을 담고 있습니다. `tee()`로 스트림을 복제하면, 같은 데이터를 두 번 생성할 필요 없이 두 파이프라인에서 동시에 소비할 수 있습니다. 데이터 생성 비용은 한 번만 지불하고, 두 가지 목적으로 활용합니다.
 
-`"use cache"`는 `"use client"`, `"use server"`에 이어지는 세 번째 디렉티브입니다. 함수 또는 컴포넌트 수준에서 캐싱을 선언합니다.
-
-```javascript
-// React 19 experimental / Next.js 15 canary
-async function getUser(id) {
-  "use cache";                          // 이 함수의 결과를 캐싱
-  return await db.query(id);
-}
-
-async function ProductList({ category }) {
-  "use cache";
-  cacheTag(`products-${category}`);     // 캐시 태그 설정
-  cacheLife("hours");                   // TTL 설정
-
-  const products = await fetchProducts(category);
-  return <ul>{products.map(p => <li key={p.id}>{p.name}</li>)}</ul>;
-}
-```
-
-기존 `unstable_cache`와의 차이:
-
-| 구분 | `unstable_cache` | `"use cache"` |
-|------|-----------------|---------------|
-| 적용 레벨 | 함수 단위 | 함수/컴포넌트 단위 |
-| 캐시 키 | 수동 지정 | 인수 자동 직렬화 |
-| 태깅 | 수동 | `cacheTag()` API |
-| 유효성 만료 | `revalidate` 옵션 | `cacheLife()` API |
-
-### 4.3 Server Actions와의 통합
-
-Server Actions는 "use server" 디렉티브로 표시된 함수를 서버에서 실행하는 메커니즘입니다.
-
-```javascript
-// RSC Flight에서 Server Action 직렬화
-function registerServerReference(reference, id, exportName) {
-  return Object.defineProperties(reference, {
-    $$typeof: { value: SERVER_REFERENCE_TAG },
-    $$id: { value: id + '#' + exportName },
-    $$bound: { value: null }
-  });
-}
-
-// Client에서 Server Action 호출 시
-// POST /server-action 으로 직렬화된 args 전송
-// Server에서 역직렬화 후 실행
-// 결과를 RSC Payload로 응답
-```
-
-**Server Actions의 렌더링 통합:**
-
-```javascript
-// Form Action과 통합
-async function submitForm(formData) {
-  "use server";
-  await db.insert(formData.get("name"));
-  revalidatePath("/users");
-}
-
-function UserForm() {
-  return (
-    <form action={submitForm}>
-      <input name="name" />
-      <button type="submit">Submit</button>
-    </form>
-  );
-}
-```
-
-JavaScript 없이도 HTML form의 action으로 동작하므로, **Progressive Enhancement**를 기본으로 지원합니다.
+이 설계의 우아함은 두 파이프라인이 서로를 의식하지 않는다는 데 있습니다. SSR 파이프라인은 RSC Payload를 React 트리로 변환하고 HTML을 만들 뿐입니다. RSC 파이프라인은 컴포넌트를 실행하고 Payload를 생성할 뿐입니다. 조합은 스트림 수준에서 이루어집니다.
 
 ---
 
-## 아키텍처 전체 그림
+## PPR — 정적과 동적의 경계를 허물다
 
-```
-Browser                     Edge/Server                   Origin Server
-  │                              │                              │
-  │──── GET /page ──────────────>│                              │
-  │                              │──── RSC Render ─────────────>│
-  │                              │     ComponentMod             │
-  │                              │     .renderToReadableStream  │
-  │                              │     (<ReactServerApp />)     │
-  │                              │<── RSC Payload Stream ───────│
-  │                              │     (Flight Protocol)        │
-  │                              │                              │
-  │                              │  [tee RSC stream]            │
-  │                              │  ┌──────────────────────┐    │
-  │                              │  │ renderStream (SSR용)  │    │
-  │                              │  │ dataStream (인라인용) │    │
-  │                              │  └──────────────────────┘    │
-  │                              │                              │
-  │                              │  Fizz SSR Pipeline           │
-  │                              │  renderToPipeableStream(     │
-  │                              │    <ReactServerEntrypoint    │
-  │                              │      stream={renderStream}   │
-  │                              │    />                        │
-  │                              │  )                           │
-  │                              │                              │
-  │<── HTML Shell (즉시) ────────│  onShellReady -> pipe()      │
-  │                              │                              │
-  │<── HTML Content (스트림) ────│  Suspense 해결 시마다        │
-  │  + <script>$RS()</script>    │  writeCompletedSegment()     │
-  │                              │                              │
-  │<── RSC Payload (인라인) ─────│  __next_f.push([1, ...])     │
-  │  <script>                    │                              │
-  │   self.__next_f.push(...)    │                              │
-  │  </script>                   │                              │
-  │                              │                              │
-  │  Selective Hydration         │                              │
-  │  hydrateRoot()               │                              │
-  │  └-> React.use(__next_f)     │                              │
-  │  └-> 사용자 상호작용 우선 hydrate│                           │
-```
+**Partial Pre-rendering(PPR)**은 React 18 SSR의 다음 단계를 보여줍니다. 지금까지 정적 페이지와 동적 페이지는 이분법적이었습니다. 페이지 전체가 빌드 타임에 생성되거나, 요청마다 서버에서 생성되거나. PPR은 이 경계를 허뭅니다.
+
+PPR의 아이디어는 간단합니다. 페이지를 두 단계로 렌더링합니다. 빌드 타임에는 정적으로 결정 가능한 Shell을 미리 렌더링하고 CDN에 캐싱합니다. 요청 타임에는 동적인 부분만 서버에서 렌더링해 Shell의 빈 공간을 채웁니다.
+
+이것을 가능하게 하는 기술이 `React.postpone`입니다. 동적 데이터가 필요한 지점에서 postpone가 호출되면, React는 그 지점을 "나중에 채울 구멍"으로 표시하고 렌더링을 계속합니다. 빌드 타임에 생성된 HTML에는 이 구멍들이 포함되어 있고, 그 구멍들의 위치 정보가 별도로 저장됩니다. 요청이 들어오면 CDN에서 정적 HTML을 즉시 전송하면서, 동시에 서버가 구멍들을 채울 동적 콘텐츠를 스트리밍합니다.
+
+결과적으로 사용자는 정적 페이지의 즉각적인 응답과 동적 페이지의 맞춤형 콘텐츠를 동시에 경험합니다. Time to First Byte는 CDN 속도로, 개인화 콘텐츠는 서버 속도로.
 
 ---
 
-## 핵심 설계 원칙 요약
+## "use cache" — 세 번째 디렉티브
 
-### 왜 이런 설계인가
+`"use client"`와 `"use server"`에 이어, React 생태계에 세 번째 디렉티브가 등장하고 있습니다. `"use cache"`입니다.
 
-**1. Fizz가 Fiber와 독립적인 이유:**
-서버는 단방향 출력만 필요합니다. Fiber의 더블 버퍼링과 Lane 스케줄링은 클라이언트 상호작용을 위한 것으로, 서버에서는 순수한 오버헤드입니다. Fizz의 Task/Segment 모델은 스트림 생성에 최적화되어 있습니다.
+이 디렉티브는 함수나 컴포넌트 수준에서 캐싱 동작을 선언합니다. 기존의 `unstable_cache`가 명시적인 캐시 키와 설정을 요구했다면, `"use cache"`는 함수의 인수를 자동으로 직렬화해 캐시 키를 생성합니다. 개발자는 캐싱에 대해 생각하는 대신, 함수의 의도만 선언합니다.
 
-**2. RSC Payload가 HTML이 아닌 이유:**
-HTML은 컴포넌트 경계, props, 상태를 표현할 수 없습니다. RSC Payload는 React의 컴포넌트 트리 구조를 보존하므로 클라이언트에서 완전한 React 트리로 복원할 수 있으며, 클라이언트 사이드 네비게이션 시 부분 업데이트가 가능합니다.
-
-**3. 두 스트림을 tee()하는 이유:**
-RSC 스트림 하나를 SSR과 데이터 인라인에 동시에 사용해야 합니다. tee()로 분기하면 같은 데이터를 두 번 생성하지 않고 두 용도로 활용할 수 있습니다.
-
-**4. onShellReady vs onAllReady의 철학:**
-TTFB(Time to First Byte)를 최소화하려면 onShellReady에서 즉시 전송해야 합니다. 반면 정적 생성처럼 완전한 HTML이 필요한 경우 onAllReady를 사용합니다. 하나의 API(renderToPipeableStream)가 두 시나리오를 모두 지원합니다.
+더 중요한 것은 이것이 React의 컴포넌트 모델과 통합된다는 점입니다. 컴포넌트 자체를 `"use cache"`로 표시하면, 같은 props로 렌더링된 결과가 캐싱됩니다. RSC 파이프라인은 캐시 히트 시 서버에서 컴포넌트를 재실행하는 대신 저장된 RSC Payload를 재사용합니다. 데이터베이스 쿼리부터 컴포넌트 렌더링까지, 캐싱이 아키텍처의 일급 시민이 됩니다.
 
 ---
 
-## 참고 소스
+## 설계 원칙의 일관성
 
-- `react-dom/cjs/react-dom-server.node.development.js` - Fizz 렌더러 전체
-- `react-dom/cjs/react-dom-server-legacy.node.development.js` - renderToString 구현
-- `react-dom/cjs/react-dom.development.js` - Selective Hydration
-- `next/dist/esm/server/app-render/app-render.js` - Next.js App Router 렌더 파이프라인
-- `next/dist/esm/server/app-render/use-flight-response.js` - RSC 스트림 처리
-- `next/dist/esm/server/app-render/static/static-renderer.js` - PPR 구현
-- `next/dist/compiled/react-server-dom-turbopack-experimental/cjs/react-server-dom-turbopack-server.edge.production.js` - Flight 프로토콜
+React 18 SSR 아키텍처 전반에는 몇 가지 일관된 설계 철학이 흐릅니다.
+
+**목적에 맞는 도구.** Fizz는 Fiber와 코드를 공유하지 않습니다. 클라이언트와 서버의 요구사항이 근본적으로 다르기 때문에, 같은 코드를 재사용하려는 시도 자체를 포기했습니다. 복잡성을 줄이기 위해 공유를 포기한 것이 아니라, 각 환경에 최적화하기 위해 분리를 선택했습니다.
+
+**점진적 전달.** Shell 먼저, Content 나중. 정적 Shell 먼저, 동적 Content 나중. 작은 것을 빨리 보여주고, 큰 것을 나중에 완성한다는 원칙이 API 설계와 아키텍처 전반에 반영되어 있습니다.
+
+**경계의 명시화.** `"use client"`, `"use server"`, `"use cache"`. 컴포넌트가 어느 환경에서 실행되는지, 어떤 데이터 전략을 사용하는지를 코드에 명시적으로 선언합니다. 암묵적인 규칙 대신 명시적인 경계가 대규모 팀에서의 일관성을 보장합니다.
+
+**데이터는 한 번만.** RSC 스트림의 `tee()`가 보여주듯, 같은 데이터를 두 번 생성하지 않습니다. SSR과 hydration에 필요한 정보를 하나의 스트림에서 추출합니다. 이 원칙은 성능 최적화이면서 동시에 일관성 보장입니다. 서버 HTML과 클라이언트 hydration 데이터가 같은 소스에서 파생되므로, 불일치가 구조적으로 불가능합니다.
+
+---
+
+## 마치며
+
+`renderToString`에서 Fizz로, 그리고 Server Components로의 여정은 단순한 기능 추가가 아닙니다. 웹의 근본적인 제약, 즉 네트워크 지연과 번들 크기와 서버-클라이언트 경계에 대한 React 팀의 새로운 답변입니다.
+
+흥미로운 것은 이 모든 복잡성이 개발자 인터페이스에서는 상대적으로 간단하게 보인다는 점입니다. `async` 함수로 Server Component를 작성하고, `Suspense`로 로딩 상태를 선언하고, `"use client"`로 클라이언트 컴포넌트를 표시합니다. 내부의 두 렌더 파이프라인, Flight 프로토콜, Segment 기반 스트리밍은 추상화 뒤에 숨어 있습니다.
+
+좋은 추상화는 복잡성을 제거하지 않습니다. 복잡성을 적절한 계층에 위치시킵니다. React 18 SSR은 그 원칙의 정교한 실천입니다.
