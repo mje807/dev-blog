@@ -1,1899 +1,256 @@
-# React 아키텍처 심층 분석 (3/14): Hooks 시스템 — "상태란 무엇인가"를 다시 묻다
+---
+title: "React Hooks 시스템: 상태는 클로저가 아니라 연결 리스트에 산다"
+date: "2025-02-20"
+tags: [React, Hooks, Architecture, Fiber, Concurrent Mode]
+series: "React 아키텍처 심층 분석"
+---
 
-> **React 아키텍처 심층 분석** 시리즈의 세 번째 글입니다. [2편](react-architecture-02-fiber-architecture.md)에서 우리는 Fiber가 어떻게 렌더링 작업을 중단·재개 가능한 단위로 쪼개는지 소스 코드로 추적했습니다. 이번 편에서는 그 Fiber 위에 구축된 **Hooks 시스템**의 내부를 해부합니다. Dispatcher 교체 메커니즘, Hook 연결 리스트, `dispatchSetState`의 Eager 최적화, Effect 원형 연결 리스트, 커밋 단계의 Effect 실행 순서, Rules of Hooks 강제 메커니즘, Concurrent Mode에서의 Tearing 방지까지 — 실제 React 18 소스 코드와 함께 추적합니다.
-
-> **참조 소스**: `packages/react-reconciler/src/ReactFiberHooks.js` (React v18, 로컬 `react-dom.development.js` 직접 분석)
+> **React 아키텍처 심층 분석** 시리즈의 세 번째 글입니다. [2편](react-architecture-02-fiber-architecture.md)에서는 Fiber가 렌더링 작업을 중단·재개 가능한 단위로 쪼개는 방식을 추적했습니다. 이번 편에서는 그 Fiber 위에 구축된 **Hooks 시스템**의 내부 작동 원리를 해부합니다.
 
 ---
 
-## 목차
+## 1. Hook은 왜 태어났는가: 클래스 컴포넌트의 세 가지 결함
 
-1. [클래스 컴포넌트의 근본적 문제: Hooks가 탄생한 이유](#1-클래스-컴포넌트의-근본적-문제)
-2. [모듈 레벨 변수: Hook 시스템의 전역 상태](#2-모듈-레벨-변수)
-3. [Dispatcher 패턴: 렌더 시점에 따른 구현 교체](#3-dispatcher-패턴)
-4. [renderWithHooks: Hook의 진입점](#4-renderwithHooks)
-5. [Hook 연결 리스트: Fiber.memoizedState의 실제 구조](#5-hook-연결-리스트)
-6. [mountWorkInProgressHook vs updateWorkInProgressHook](#6-mountworkinprogresshook-vs-updateworkinprogresshook)
-7. [useState / useReducer: 상태 업데이트의 전체 흐름](#7-usestate--usereducer)
-8. [dispatchSetState: Eager State 최적화와 Lane 할당](#8-dispatchsetstate)
-9. [updateReducer: baseQueue와 Lane 필터링](#9-updatereducer)
-10. [렌더 중 setState: RE_RENDER_LIMIT = 25](#10-렌더-중-setstate)
-11. [useEffect 내부: Effect 원형 연결 리스트](#11-useeffect-내부)
-12. [Effect 실행 타이밍: 3계층 구조](#12-effect-실행-타이밍)
-13. [commitHookEffectListMount/Unmount: 커밋 단계의 Effect 처리](#13-commithookeffectlist)
-14. [Passive Effects 비동기 스케줄링: MessageChannel](#14-passive-effects-비동기-스케줄링)
-15. [Strict Mode의 Effect 이중 실행](#15-strict-mode의-effect-이중-실행)
-16. [useMemo / useCallback: 메모이제이션의 실제 구현](#16-usememo--usecallback)
-17. [useRef: 가장 단순하지만 가장 강력한 Hook](#17-useref)
-18. [useContext: 컨텍스트 의존성 추적](#18-usecontext)
-19. [Rules of Hooks: 정적 분석과 런타임 강제](#19-rules-of-hooks)
-20. [Concurrent Mode와 Tearing: useSyncExternalStore](#20-concurrent-mode와-tearing)
-21. [useId: 서버-클라이언트 일관성을 위한 결정론적 ID](#21-useid)
-22. [Lane 시스템과 Hook 통합](#22-lane-시스템과-hook-통합)
-23. [전체 흐름: 컴포넌트 렌더에서 화면까지](#23-전체-흐름)
+기술은 문제를 해결하기 위해 탄생합니다. Hooks(2019년, React 16.8)도 예외가 아닙니다. 이것이 단순한 편의 기능이 아니라 React 아키텍처의 근본적인 전환점인 이유를 이해하려면, 먼저 이전 세계의 고통을 직시해야 합니다.
+
+### 논리의 분산: 생명주기 메서드의 역설
+
+클래스 컴포넌트의 생명주기 메서드는 표면적으로 질서정연해 보입니다. `componentDidMount`에서 설정하고, `componentWillUnmount`에서 정리한다. 논리적으로 완벽해 보이는 이 구조가 왜 문제가 되는 걸까요?
+
+문제는 "언제" 기준이 아니라 "무엇" 기준으로 코드를 묶어야 한다는 데 있습니다. 예를 들어 하나의 컴포넌트가 사용자 구독 설정, 데이터 페칭, 문서 타이틀 변경을 모두 담당한다면, 이 세 가지 논리는 각각 `componentDidMount`, `componentDidUpdate`, `componentWillUnmount` 전체에 걸쳐 파편화됩니다. 관련 없는 코드가 같은 메서드 안에 뒤섞이고, 관련 있는 코드는 세 개의 메서드로 분리됩니다. 컴포넌트가 커질수록 이 역설은 심화됩니다.
+
+### 재사용 불가: Wrapper Hell
+
+상태 로직을 재사용하려면 Higher-Order Component(HOC) 패턴이나 Render Props 패턴을 사용해야 했습니다. 두 패턴 모두 컴포넌트를 겹겹이 감싸는 방식으로 동작합니다. 이 구조는 "Wrapper Hell"이라고 불리는데, React DevTools에서 보면 실제 로직과 무관한 래퍼 컴포넌트들이 10~20겹으로 쌓인 트리를 마주하게 됩니다. 렌더링 성능, 디버깅 경험, 코드 가독성 모두 타격을 입습니다.
+
+### this 바인딩: 우발적 복잡성
+
+`this`는 JavaScript의 언어적 개념이지 React의 개념이 아닙니다. 클래스 기반 컴포넌트가 React에 도입되면서 개발자들은 `this.handleClick.bind(this)`, 화살표 함수 클래스 필드 등 다양한 우회책을 익혀야 했습니다. 이는 React가 해결해야 할 도메인 문제가 아닌데도 인지적 부담이 됐습니다.
+
+### Hooks의 해결책: 관심사의 응집
+
+Hooks는 "언제" 대신 "무엇"을 기준으로 코드를 묶을 수 있게 합니다. 사용자 구독에 관련된 설정, 업데이트, 정리 로직을 모두 하나의 `useEffect` 안에 담을 수 있습니다. 재사용은 함수 호출로 가능하고, `this`는 존재하지 않습니다. 그런데 이 우아한 설계는 어떻게 실제로 동작할까요?
 
 ---
 
-## 1. 클래스 컴포넌트의 근본적 문제
+## 2. Hook의 정체: Fiber에 붙은 연결 리스트
 
-Hooks가 2019년 React 16.8에 등장하기 전, 상태를 가진 컴포넌트는 클래스로만 작성할 수 있었습니다. 표면적으로는 편리해 보였지만, 클래스 컴포넌트는 세 가지 근본적인 문제를 가지고 있었습니다.
+Hooks를 처음 배울 때 많은 개발자들이 "클로저 기반의 상태 관리"라고 이해합니다. 함수 컴포넌트가 실행될 때마다 새로운 스코프가 생기고, 상태가 그 클로저 어딘가에 캡처된다는 직관입니다. 이 직관은 틀렸습니다.
 
-### 1-1. 논리의 분산: 생명주기 메서드
+Hook의 상태는 **컴포넌트 함수 자체가 아니라, 해당 컴포넌트를 표현하는 Fiber 노드에 저장됩니다.** 구체적으로는 `Fiber.memoizedState` 프로퍼티에 연결 리스트(linked list) 형태로 붙어있습니다.
 
-```javascript
-class UserProfile extends React.Component {
-  componentDidMount() {
-    // 구독 설정
-    this.subscription = userStore.subscribe(this.update);
-    // 데이터 페칭
-    fetchUser(this.props.userId).then(user => this.setState({ user }));
-    // 문서 타이틀 설정
-    document.title = 'Profile';
-  }
+각 Hook은 다음 구조를 가진 노드 하나에 대응합니다: 현재 저장된 값(`memoizedState`), 업데이트 계산의 기준이 되는 상태(`baseState`), 이전 렌더에서 우선순위 문제로 건너뛴 업데이트들(`baseQueue`), 새로 들어온 업데이트들을 담는 큐(`queue`), 다음 Hook 노드를 가리키는 포인터(`next`). 이 노드들이 `next`로 연결되어 하나의 체인을 이룹니다.
 
-  componentDidUpdate(prevProps) {
-    // userId가 바뀌면 새로 페칭
-    if (prevProps.userId !== this.props.userId) {
-      fetchUser(this.props.userId).then(user => this.setState({ user }));
-    }
-  }
+컴포넌트 안에서 `useState`, `useEffect`, `useMemo`를 차례로 호출하면, Fiber.memoizedState는 그 순서 그대로 연결된 세 개의 Hook 노드를 가지게 됩니다. Hook이 호출 순서를 엄격하게 지켜야 하는 이유가 여기에 있습니다. 순서가 바뀌면 React는 각 Hook 노드가 어떤 `useState`나 `useEffect`와 대응하는지 알 수 없게 됩니다.
 
-  componentWillUnmount() {
-    // 구독 해제
-    this.subscription.unsubscribe();
-  }
-}
-```
-
-"구독 설정"이라는 하나의 논리가 `componentDidMount`, `componentDidUpdate`, `componentWillUnmount` 세 곳에 분산됩니다. 수십 개의 기능이 하나의 컴포넌트에 모이면, 관련 없는 코드가 같은 메서드에 뒤섞이게 됩니다.
-
-### 1-2. 재사용 불가: Wrapper Hell
-
-상태 로직을 재사용하려면 Higher-Order Component(HOC)나 Render Props를 사용해야 했습니다.
-
-```jsx
-// HOC 패턴 - 컴포넌트를 래핑
-const withUser = (Component) => (props) =>
-  <UserContext.Consumer>
-    {user => <Component {...props} user={user} />}
-  </UserContext.Consumer>;
-
-// 실제 사용 시 래핑이 중첩
-withUser(withTheme(withRouter(withAnalytics(MyComponent))))
-```
-
-React DevTools에서 보면 "Wrapper Hell" — 의미 없는 컴포넌트 계층이 무한히 쌓입니다.
-
-### 1-3. this 바인딩 문제
-
-```javascript
-class Counter extends React.Component {
-  // 이렇게 하지 않으면 this가 undefined
-  handleClick = () => {
-    this.setState(prev => ({ count: prev.count + 1 }));
-  };
-}
-```
-
-`this`는 JavaScript의 언어적 개념이지 React의 개념이 아닙니다. 클래스가 도입한 우발적 복잡성입니다.
-
-### 1-4. Hooks의 해결책: 관심사의 응집
-
-```jsx
-function useUser(userId) {
-  const [user, setUser] = useState(null);
-
-  useEffect(() => {
-    const subscription = userStore.subscribe(() => {
-      fetchUser(userId).then(setUser);
-    });
-    fetchUser(userId).then(setUser);
-    document.title = 'Profile';
-
-    return () => subscription.unsubscribe();  // 정리 로직도 함께
-  }, [userId]);  // 의존성 명시
-
-  return user;
-}
-```
-
-관련 논리가 한 곳에 모이고, 재사용이 함수 호출로 가능해지며, `this`가 없어집니다. 그런데 이 마법 같은 동작은 어떻게 구현될까요?
+각 Hook 종류마다 `memoizedState`에 저장하는 값이 다릅니다. `useState`와 `useReducer`는 현재 상태 값 자체를, `useEffect`는 effect 함수와 cleanup 함수, 의존성 배열을 담은 Effect 객체를, `useMemo`는 계산된 값과 deps 배열의 쌍을, `useRef`는 `{ current: value }` 객체를 저장합니다. 하나의 자료구조 안에서 이렇게 다양한 역할을 표현하는 것이 Hook 시스템의 유연성이자, 타입 안전성을 직접 보장하기 어려운 이유이기도 합니다.
 
 ---
 
-## 2. 모듈 레벨 변수: Hook 시스템의 전역 상태
+## 3. Dispatcher 패턴: 같은 코드, 다른 실행
 
-`ReactFiberHooks.js` 상단에는 모듈 스코프 변수들이 있습니다. 이것들이 Hook 시스템 전체의 "레지스터"입니다.
+`useState`를 호출하면 React 내부에서 무슨 일이 일어날까요? 단순히 상태를 읽는 것이 아닙니다. **컴포넌트가 처음 마운트되는 중인지, 재렌더 중인지에 따라 완전히 다른 구현이 실행됩니다.**
 
-```javascript
-// 현재 렌더링 중인 Fiber
-let currentlyRenderingFiber: Fiber = (null: any);
+React는 이를 Dispatcher 패턴으로 구현합니다. `ReactCurrentDispatcher.current`라는 전역 포인터가 있고, 렌더 시점마다 이 포인터를 다른 객체로 교체합니다. 개발자가 `useState`를 호출하면, 실제로는 이 포인터가 가리키는 객체의 `useState`가 실행됩니다.
 
-// Current 트리의 Hook 포인터 (이전 렌더의 Hook 체인)
-let currentHook: Hook | null = null;
+마운트 시에는 `HooksDispatcherOnMount`가 활성화되고, 여기서 `useState`는 새 Hook 노드를 생성하고 초기값을 설정합니다. 재렌더 시에는 `HooksDispatcherOnUpdate`로 교체되고, 동일한 `useState` 호출이 이번에는 기존 Hook 노드에서 저장된 상태를 읽고 업데이트를 처리합니다.
 
-// Work In Progress 트리의 Hook 포인터 (현재 렌더의 Hook 체인)
-let workInProgressHook: Hook | null = null;
+렌더가 끝나면 Dispatcher는 즉시 `ContextOnlyDispatcher`로 복귀합니다. 이 Dispatcher의 모든 Hook은 에러를 던집니다. 이것이 `useEffect` 콜백 안에서 `useState`를 호출하면 "Invalid hook call" 에러가 발생하는 이유입니다. useEffect 콜백은 렌더가 완료된 후 비동기적으로 실행되므로, 그 시점의 Dispatcher는 이미 에러를 던지는 상태입니다.
 
-// 렌더 단계 업데이트 감지
-let didScheduleRenderPhaseUpdate: boolean = false;
-let didScheduleRenderPhaseUpdateDuringThisPass: boolean = false;
-
-// 재렌더 횟수 제한
-let numberOfReRenders: number = 0;
-const RE_RENDER_LIMIT = 25;
-
-// 현재 렌더 레인
-let renderLanes: Lanes = NoLanes;
-```
-
-이 변수들은 함수 컴포넌트가 실행되는 동안만 유효한 상태를 담습니다. 렌더가 완료되면 모두 초기화됩니다.
-
-**DEV 전용 변수들:**
-```javascript
-// DEV 모드에서 Hook 순서 추적
-let currentHookNameInDev: ?HookType = null;
-let hookTypesDev: HookType[] | null = null;         // 최초 마운트 시 Hook 이름 기록
-let hookTypesUpdateIndexDev: number = -1;            // 업데이트 시 인덱스
-```
-
-이 DEV 변수들이 Rules of Hooks를 런타임에 강제하는 핵심입니다.
+이 설계는 단일 진입점(`useState`)을 유지하면서 런타임 컨텍스트에 따라 구현을 교체하는 전략입니다. 개발자가 마운트인지 업데이트인지 신경 쓸 필요가 없는 이유가 여기에 있습니다.
 
 ---
 
-## 3. Dispatcher 패턴: 렌더 시점에 따른 구현 교체
+## 4. renderWithHooks: 함수 컴포넌트의 진입점
 
-`ReactCurrentDispatcher.current`는 현재 어떤 Hook 구현을 사용할지 결정합니다.
+Fiber 재조정 과정에서 함수 컴포넌트를 처리할 때 `renderWithHooks`가 호출됩니다. 이 함수가 Hook 시스템 전체의 출발점이자 환경 설정자입니다.
 
-```javascript
-// packages/react/src/ReactCurrentDispatcher.js
-const ReactCurrentDispatcher = {
-  current: (null: null | Dispatcher),
-};
-```
+이 함수가 하는 일을 순서대로 보면: 먼저 `workInProgress.memoizedState`를 null로 초기화합니다(새 Hook 체인을 처음부터 다시 만들 준비). 그런 다음 현재 상황에 맞는 Dispatcher를 설정합니다. 그 후 컴포넌트 함수를 실행합니다 — 이 실행 과정에서 개발자가 작성한 모든 Hook 호출이 일어납니다. 컴포넌트가 렌더 중에 `setState`를 호출했다면(파생 상태 패턴 등), 최대 25회까지 재실행을 반복합니다. 마지막으로 Dispatcher를 `ContextOnlyDispatcher`로 복귀시킵니다.
 
-```javascript
-// packages/react/src/ReactHooks.js
-export function useState<S>(initialState: (() => S) | S) {
-  const dispatcher = resolveDispatcher();
-  return dispatcher.useState(initialState);
-}
-
-function resolveDispatcher() {
-  const dispatcher = ReactCurrentDispatcher.current;
-  if (dispatcher === null) {
-    throw new Error('Invalid hook call. Hooks can only be called inside a function component.');
-  }
-  return dispatcher;
-}
-```
-
-`useState`를 호출하면 `ReactCurrentDispatcher.current.useState`가 실행됩니다. React는 렌더 시점에 따라 이 포인터를 다른 객체로 교체합니다.
-
-### Dispatcher 종류
-
-| Dispatcher | 사용 시점 | useState 구현 |
-|-----------|----------|--------------|
-| `HooksDispatcherOnMount` | 첫 렌더링 | `mountState` |
-| `HooksDispatcherOnUpdate` | 재렌더링 | `updateState → updateReducer` |
-| `HooksDispatcherOnRerender` | 렌더 중 setState | `rerenderState → rerenderReducer` |
-| `ContextOnlyDispatcher` | 렌더 외부 | `throwInvalidHookError` |
-
-`ContextOnlyDispatcher`는 모든 Hook에 대해 에러를 던집니다:
-```javascript
-const ContextOnlyDispatcher: Dispatcher = {
-  useState: throwInvalidHookError,
-  useEffect: throwInvalidHookError,
-  useMemo: throwInvalidHookError,
-  // ... 모든 Hook이 에러
-};
-
-function throwInvalidHookError() {
-  throw new Error(
-    'Invalid hook call. Hooks can only be called inside of the body of a function component.'
-  );
-}
-```
-
-렌더가 끝나면 Dispatcher는 반드시 `ContextOnlyDispatcher`로 복귀합니다. 이것이 `useEffect` 콜백 내부에서 `useState`를 호출하면 에러가 나는 이유입니다.
+25회 재실행 한도는 `RE_RENDER_LIMIT = 25`로 정의되어 있습니다. 이 한도를 초과하면 "Too many re-renders" 에러가 발생합니다. 이 숫자는 임의적으로 보이지만, 대부분의 합법적인 파생 상태 계산은 훨씬 적은 횟수 안에 수렴하므로 실용적인 안전망입니다.
 
 ---
 
-## 4. renderWithHooks: Hook의 진입점
+## 5. 새 Hook vs 기존 Hook: 마운트와 업데이트의 분기
 
-`beginWork`에서 함수 컴포넌트를 처리할 때 `renderWithHooks`가 호출됩니다.
+Hook 노드를 다루는 두 함수가 Hook 시스템의 핵심 메커니즘을 담고 있습니다.
 
-```javascript
-// ReactFiberHooks.js (React 18.3.1 기준)
-export function renderWithHooks<Props, SecondArg>(
-  current: Fiber | null,
-  workInProgress: Fiber,
-  Component: (p: Props, arg: SecondArg) => any,
-  props: Props,
-  secondArg: SecondArg,
-  nextRenderLanes: Lanes,
-): any {
-  renderLanes = nextRenderLanes;
-  currentlyRenderingFiber = workInProgress;
+마운트 시 `mountWorkInProgressHook`은 새 Hook 노드 객체를 생성하고 이를 Fiber의 `memoizedState` 체인 끝에 연결합니다. 처음 Hook이라면 Fiber.memoizedState에 직접 연결하고, 이후 Hook이라면 체인의 끝에 이어붙입니다. 이 과정에서 Hook 순서가 Fiber에 기록됩니다.
 
-  // DEV: 이전 렌더의 Hook 타입 목록 복원
-  if (__DEV__) {
-    hookTypesDev = current !== null
-      ? ((current._debugHookTypes: any): HookType[])
-      : null;
-    hookTypesUpdateIndexDev = -1;
-    ignorePreviousDependencies =
-      current !== null && current.type !== workInProgress.type;
-  }
+업데이트 시 `updateWorkInProgressHook`은 전혀 다른 일을 합니다. 이전 렌더의 Hook 체인(current Fiber의 `memoizedState`)에서 대응하는 노드를 찾아 복제합니다. 이때 `queue` 프로퍼티는 복제되지 않고 **동일한 참조를 공유**합니다. 이 큐가 `setState`가 호출될 때 업데이트가 쌓이는 곳이기 때문입니다. current 트리와 work-in-progress 트리가 같은 큐를 바라보고 있어야, 렌더 도중 발생한 업데이트가 유실되지 않습니다.
 
-  // 1. Hook 체인 초기화 (매 렌더마다)
-  workInProgress.memoizedState = null;
-  workInProgress.updateQueue = null;
-  workInProgress.lanes = NoLanes;
-
-  // 2. Dispatcher 선택 (핵심!)
-  if (__DEV__) {
-    if (current !== null && current.memoizedState !== null) {
-      ReactCurrentDispatcher.current = HooksDispatcherOnUpdateInDEV;
-    } else if (hookTypesDev !== null) {
-      ReactCurrentDispatcher.current = HooksDispatcherOnMountWithHookTypesInDEV;
-    } else {
-      ReactCurrentDispatcher.current = HooksDispatcherOnMountInDEV;
-    }
-  } else {
-    ReactCurrentDispatcher.current =
-      current === null || current.memoizedState === null
-        ? HooksDispatcherOnMount
-        : HooksDispatcherOnUpdate;
-  }
-
-  // 3. 컴포넌트 실행 (이 안에서 모든 Hook이 호출됨)
-  let children = Component(props, secondArg);
-
-  // 4. 렌더 중 setState 처리 (재렌더 루프)
-  if (didScheduleRenderPhaseUpdateDuringThisPass) {
-    let numberOfReRenders: number = 0;
-    do {
-      didScheduleRenderPhaseUpdateDuringThisPass = false;
-      localIdCounter = 0;
-
-      if (numberOfReRenders >= RE_RENDER_LIMIT) {
-        throw new Error(
-          'Too many re-renders. React limits the number of renders to prevent ' +
-          'an infinite loop.'
-        );
-      }
-
-      numberOfReRenders += 1;
-
-      // Hook 포인터 리셋
-      currentHook = null;
-      workInProgressHook = null;
-
-      workInProgress.updateQueue = null;
-
-      ReactCurrentDispatcher.current = __DEV__
-        ? HooksDispatcherOnRerenderInDEV
-        : HooksDispatcherOnRerender;
-
-      children = Component(props, secondArg);
-    } while (didScheduleRenderPhaseUpdateDuringThisPass);
-  }
-
-  // 5. Dispatcher를 Invalid로 리셋 (렌더 외부 Hook 호출 방지)
-  ReactCurrentDispatcher.current = ContextOnlyDispatcher;
-
-  // 6. DEV: Hook 개수 감소 감지
-  const didRenderTooFewHooks =
-    currentHook !== null && currentHook.next !== null;
-
-  // 7. 정리
-  renderLanes = NoLanes;
-  currentlyRenderingFiber = (null: any);
-  currentHook = null;
-  workInProgressHook = null;
-
-  if (didRenderTooFewHooks) {
-    throw new Error('Rendered fewer hooks than expected.');
-  }
-
-  return children;
-}
-```
-
-이 함수의 핵심 설계 포인트:
-- **Dispatcher는 렌더 전에 설정**: 컴포넌트 실행 전 `ReactCurrentDispatcher.current`를 교체하여 모든 Hook 호출이 올바른 구현을 사용하도록 합니다.
-- **렌더 후 즉시 리셋**: 컴포넌트 실행이 끝나면 `ContextOnlyDispatcher`로 교체하여 비동기 컨텍스트에서의 Hook 호출을 차단합니다.
-- **재렌더 루프**: `didScheduleRenderPhaseUpdateDuringThisPass`가 true면 최대 25번까지 재렌더합니다.
+이 과정에서 Hook 개수가 맞지 않으면 에러가 발생합니다. 이전 렌더보다 Hook이 많으면 "Rendered more hooks than during the previous render", 적으면 "Rendered fewer hooks than expected". Rules of Hooks가 실제로 강제되는 순간입니다.
 
 ---
 
-## 5. Hook 연결 리스트: Fiber.memoizedState의 실제 구조
+## 6. useState와 useReducer: 실은 하나다
 
-각 Hook은 `Hook` 객체로 표현됩니다:
+`useState`는 `useReducer`의 특수한 형태입니다. 내부 구현에서 두 Hook은 모두 `updateReducer`라는 동일한 함수로 합류합니다. 차이는 사용되는 reducer 함수뿐입니다.
 
-```typescript
-interface Hook {
-  memoizedState: any;       // 현재 저장된 값 (Hook마다 의미가 다름)
-  baseState: any;           // 업데이트 계산의 기준 상태
-  baseQueue: Update | null; // 이전 렌더에서 건너뛴 업데이트
-  queue: any;               // 업데이트 큐 (useState/useReducer) 또는 null
-  next: Hook | null;        // 다음 Hook (연결 리스트)
-}
-```
+`useState`의 경우 React가 내장한 `basicStateReducer`를 사용합니다. 이 reducer는 단순한 규칙을 따릅니다: 액션이 함수이면 그 함수를 현재 상태에 적용하고(함수형 업데이트), 함수가 아니면 그 값 자체를 새 상태로 사용합니다. 이것이 `setState(42)`와 `setState(prev => prev + 1)` 두 형태를 모두 지원하는 이유입니다.
 
-`memoizedState`는 Hook 종류에 따라 다른 값을 저장합니다:
+`useReducer`는 이 자리에 개발자가 정의한 reducer 함수를 넣습니다. 복잡한 상태 전환 로직, 여러 액션 타입 처리, 이전 상태를 참조하는 계산이 필요할 때 `useReducer`가 더 명시적인 선택이 되는 이유가 여기에 있습니다.
 
-| Hook | memoizedState 저장 값 |
-|------|----------------------|
-| `useState` / `useReducer` | 현재 상태 값 |
-| `useEffect` / `useLayoutEffect` | `Effect` 객체 |
-| `useMemo` | `[cachedValue, deps]` 배열 |
-| `useCallback` | `[callback, deps]` 배열 |
-| `useRef` | `{ current: value }` 객체 |
-| `useContext` | 현재 컨텍스트 값 |
-| `useId` | 생성된 ID 문자열 |
-
-전체 Hook 체인의 메모리 레이아웃:
-
-```
-Fiber.memoizedState
-        │
-        ▼
-┌──────────────────────────────────────────────────┐
-│ Hook #1: useState(0)                              │
-│  memoizedState: 42        ← 현재 카운터 값         │
-│  baseState: 42            ← 업데이트 기준          │
-│  baseQueue: null                                   │
-│  queue: {                                          │
-│    pending: null,         ← 대기 중 업데이트        │
-│    lanes: 0,                                       │
-│    dispatch: setState,    ← 바인딩된 setState       │
-│    lastRenderedReducer: basicStateReducer,          │
-│    lastRenderedState: 42                           │
-│  }                                                 │
-│  next: ──────────────────────────────────────────► │
-└──────────────────────────────────────────────────┘
-        ▼
-┌──────────────────────────────────────────────────┐
-│ Hook #2: useEffect(() => {...}, [dep])            │
-│  memoizedState: {                                  │
-│    tag: Passive | HasEffect,  ← 비트마스크 플래그  │
-│    create: () => {...},       ← effect 함수        │
-│    destroy: cleanup,          ← cleanup 함수       │
-│    deps: [dep],               ← 의존성 배열        │
-│    next: ──────────────►(원형 연결)                │
-│  }                                                 │
-│  next: ──────────────────────────────────────────► │
-└──────────────────────────────────────────────────┘
-        ▼
-┌──────────────────────────────────────────────────┐
-│ Hook #3: useMemo(() => compute(), [b])            │
-│  memoizedState: [computedValue, [b]]              │
-│  next: null                   ← 마지막 Hook        │
-└──────────────────────────────────────────────────┘
-```
+마운트 시 `mountState`는 초기값을 설정하고 업데이트 큐를 생성합니다. 주목할 점은 `initialState`가 함수인 경우 즉시 실행한다는 것입니다. 이것이 lazy initialization 기능입니다 — 비용이 큰 초기값 계산을 컴포넌트가 처음 마운트될 때 한 번만 실행하도록 최적화합니다.
 
 ---
 
-## 6. mountWorkInProgressHook vs updateWorkInProgressHook
+## 7. dispatchSetState: setState가 호출될 때 실제로 일어나는 일
 
-### 마운트: 새 Hook 생성
+`const [count, setCount] = useState(0)`에서 반환되는 `setCount`는 `dispatchSetState`를 현재 Fiber와 업데이트 큐에 미리 바인딩한 함수입니다. `setCount(5)`를 호출하면 내부적으로 `dispatchSetState(fiber, queue, 5)`가 실행됩니다.
+
+이 함수가 가장 먼저 하는 일은 현재 컨텍스트의 우선순위 Lane을 결정하는 것입니다. 같은 `setCount` 호출이라도 버튼 클릭 이벤트 핸들러 안에서 실행되면 높은 우선순위의 `InputDiscreteLane`을, `startTransition` 안에서 실행되면 낮은 우선순위의 `TransitionLane`을, `setTimeout` 안에서 실행되면 중간 우선순위의 `DefaultLane`을 받습니다. 이 Lane이 나중에 해당 업데이트가 어떤 렌더 사이클에서 처리될지를 결정합니다.
+
+그 다음 **Eager State 최적화**가 이루어집니다. 이것은 React가 렌더링 자체를 건너뛸 수 있는 가장 이른 시점의 최적화입니다. 현재 Fiber와 그 alternate에 대기 중인 업데이트가 없다면, React는 새 상태를 미리 계산해봅니다. 그 결과가 현재 상태와 동일하다면(`Object.is` 기준) 스케줄링 자체를 중단합니다. Fiber Reconciler가 깨어나지 않습니다.
 
 ```javascript
-// react-dom.development.js L15632
-function mountWorkInProgressHook(): Hook {
-  const hook: Hook = {
-    memoizedState: null,
-    baseState: null,
-    baseQueue: null,
-    queue: null,
-    next: null,
-  };
-
-  if (workInProgressHook === null) {
-    // 첫 번째 Hook: Fiber.memoizedState에 직접 연결
-    currentlyRenderingFiber.memoizedState = workInProgressHook = hook;
-  } else {
-    // 이후 Hook: 체인 끝에 추가
-    workInProgressHook = workInProgressHook.next = hook;
-  }
-
-  return workInProgressHook;
+// 이 시점에서 이미 렌더링 스킵 여부가 결정됩니다
+const eagerState = lastRenderedReducer(currentState, action);
+if (is(eagerState, currentState)) {
+  return; // scheduleUpdateOnFiber가 호출되지 않음
 }
 ```
 
-### 업데이트: 이전 Hook 복제
-
-```javascript
-// react-dom.development.js L15652
-function updateWorkInProgressHook(): Hook {
-  // 1. current 트리의 다음 Hook 결정
-  let nextCurrentHook: null | Hook;
-  if (currentHook === null) {
-    // 첫 번째 Hook: current Fiber에서 시작
-    const current = currentlyRenderingFiber.alternate;
-    if (current !== null) {
-      nextCurrentHook = current.memoizedState;  // current의 첫 Hook
-    } else {
-      nextCurrentHook = null;
-    }
-  } else {
-    nextCurrentHook = currentHook.next;  // 다음 Hook
-  }
-
-  // 2. WIP 트리의 다음 Hook 결정 (재렌더 시 재사용 가능)
-  let nextWorkInProgressHook: null | Hook;
-  if (workInProgressHook === null) {
-    nextWorkInProgressHook = currentlyRenderingFiber.memoizedState;
-  } else {
-    nextWorkInProgressHook = workInProgressHook.next;
-  }
-
-  if (nextWorkInProgressHook !== null) {
-    // 재렌더 케이스: 이미 만들어진 WIP Hook 재사용
-    workInProgressHook = nextWorkInProgressHook;
-    nextWorkInProgressHook = workInProgressHook.next;
-    currentHook = nextCurrentHook;
-  } else {
-    // 일반 업데이트: current Hook에서 복제
-    if (nextCurrentHook === null) {
-      // 이전 렌더보다 Hook이 더 많음!
-      throw new Error('Rendered more hooks than during the previous render.');
-    }
-
-    currentHook = nextCurrentHook;
-
-    const newHook: Hook = {
-      memoizedState: currentHook.memoizedState,  // 상태 복사
-      baseState: currentHook.baseState,
-      baseQueue: currentHook.baseQueue,
-      queue: currentHook.queue,    // 중요: 동일한 큐 참조!
-      next: null,
-    };
-
-    // WIP 체인에 연결
-    if (workInProgressHook === null) {
-      currentlyRenderingFiber.memoizedState = workInProgressHook = newHook;
-    } else {
-      workInProgressHook = workInProgressHook.next = newHook;
-    }
-  }
-
-  return workInProgressHook;
-}
-```
-
-`queue`를 동일한 참조로 복사하는 것이 핵심입니다. 큐는 `setState`가 발생할 때마다 업데이트가 추가되는 살아있는 자료구조이며, current와 WIP가 이를 공유합니다.
+이 코드에서 핵심은 `return`입니다. 이 한 줄이 불필요한 렌더링 사이클 전체를 방지합니다. 이것이 `setState(sameValue)`가 리렌더를 유발하지 않는 정확한 이유이고, 동시에 `setState({})` 처럼 내용은 같지만 참조가 다른 객체를 전달하면 리렌더가 발생하는 이유입니다. `Object.is`는 참조를 비교하기 때문입니다.
 
 ---
 
-## 7. useState / useReducer: 상태 업데이트의 전체 흐름
+## 8. updateReducer: 우선순위별 업데이트 필터링
 
-### mountState: 초기화
+렌더가 시작되면 `updateReducer`가 Hook의 업데이트 큐를 처리합니다. 이 과정은 단순한 큐 드레이닝이 아닙니다. **현재 렌더의 우선순위(Lane)에 따라 처리할 업데이트와 보류할 업데이트를 선별합니다.**
 
-```javascript
-// react-dom.development.js L16162
-function mountState<S>(
-  initialState: (() => S) | S,
-): [S, Dispatch<BasicStateAction<S>>] {
-  // 1. Hook 노드 생성
-  const hook = mountWorkInProgressHook();
+업데이트 큐는 원형 연결 리스트로 구성됩니다. `updateReducer`는 이 리스트를 순회하며 각 업데이트의 Lane이 현재 렌더의 `renderLanes`에 포함되는지 확인합니다. 포함된다면 그 업데이트를 처리하고, 포함되지 않는다면 `baseQueue`에 보존하고 해당 Lane을 Fiber에 표시해 다음 렌더에서 재처리되도록 예약합니다.
 
-  // 2. Lazy 초기화 지원
-  if (typeof initialState === 'function') {
-    initialState = initialState();  // 함수면 즉시 실행
-  }
+이 메커니즘이 가진 섬세한 요구사항이 하나 있습니다. 만약 낮은 우선순위 업데이트를 건너뛴 후 높은 우선순위 업데이트를 처리한다면, 이후의 모든 업데이트도 `baseQueue`에 포함시켜야 합니다. 상태 전환의 순서가 중요하기 때문입니다. 예를 들어 업데이트가 A, B, C 순서로 들어왔고 B를 건너뛰었다면, C는 처리되더라도 `baseQueue`에도 남겨둡니다. 다음 렌더에서 `baseState`에서 시작해 B, C를 순서대로 적용해야 최종 상태의 일관성이 보장됩니다.
 
-  // 3. 초기 상태 저장
-  hook.memoizedState = hook.baseState = initialState;
-
-  // 4. 업데이트 큐 생성
-  const queue: UpdateQueue<S, BasicStateAction<S>> = {
-    pending: null,     // 대기 중인 업데이트 (원형 연결 리스트)
-    interleaved: null, // 인터리브된 업데이트
-    lanes: NoLanes,
-    dispatch: null,
-    lastRenderedReducer: basicStateReducer,
-    lastRenderedState: (initialState: any),
-  };
-  hook.queue = queue;
-
-  // 5. dispatch 함수 바인딩
-  const dispatch: Dispatch<BasicStateAction<S>> = (queue.dispatch = (
-    dispatchSetState.bind(null, currentlyRenderingFiber, queue)
-  ));
-
-  return [hook.memoizedState, dispatch];
-}
-```
-
-`basicStateReducer`는 useState가 useReducer의 특수 케이스임을 보여줍니다:
-```javascript
-function basicStateReducer<S>(state: S, action: BasicStateAction<S>): S {
-  // action이 함수면 함수형 업데이트 (prev => newValue)
-  // 아니면 직접 새 값
-  return typeof action === 'function' ? action(state) : action;
-}
-```
-
-### useState vs useReducer의 실제 차이
-
-```javascript
-function updateState<S>(initialState: (() => S) | S): [S, Dispatch<...>] {
-  return updateReducer(basicStateReducer, (initialState: any));
-}
-
-function updateReducer<S, I, A>(
-  reducer: (S, A) => S,
-  initialArg: I,
-  init?: I => S,
-): [S, Dispatch<A>] {
-  // 두 함수 모두 updateReducer로 합류
-  // 차이는 reducer 함수뿐
-}
-```
-
-**실질적 차이**:
-- `useState`: `reducer = basicStateReducer` (함수형 업데이트 + 직접 값 지원)
-- `useReducer`: `reducer = 사용자 정의 함수` (복잡한 상태 전환 로직)
-
-Eager State 최적화도 `useState`와 `useReducer` 모두에 적용되지만, `useReducer`의 경우 사용자 정의 reducer가 순수 함수가 아닐 수 있어 skip이 더 보수적으로 이루어집니다.
+이 복잡성이 Concurrent Mode에서 상태 업데이트의 일관성을 보장하는 기반입니다.
 
 ---
 
-## 8. dispatchSetState: Eager State 최적화와 Lane 할당
+## 9. useEffect의 내부: 원형 연결 리스트의 이유
 
-`setState`를 호출하면 실제로는 `dispatchSetState`가 실행됩니다:
+`useEffect`는 상태를 저장하는 대신, **Effect 객체를 Fiber의 `updateQueue`에 원형 연결 리스트로 등록합니다.** 각 Effect 객체는 실행할 함수(`create`), cleanup 함수(`destroy`), 의존성 배열(`deps`), 그리고 비트마스크 플래그(`tag`)를 담고 있습니다.
 
-```javascript
-function dispatchSetState<S, A>(
-  fiber: Fiber,
-  queue: UpdateQueue<S, A>,
-  action: A,
-): void {
-  const lane = requestUpdateLane(fiber);  // 현재 컨텍스트의 우선순위 Lane
+왜 원형 연결 리스트일까요? 커밋 단계에서 Effect를 순회할 때 `lastEffect.next`로 시작점에 접근하고, 한 바퀴를 돌면 다시 시작점으로 돌아오기 때문에 별도의 길이 추적이나 끝 표시가 필요 없습니다. 구조가 단순하고 순회 코드가 균일해집니다.
 
-  const update: Update<S, A> = {
-    lane,
-    action,
-    hasEagerState: false,
-    eagerState: null,
-    next: (null: any),
-  };
+비트마스크 플래그는 Effect의 종류를 구분합니다. `useEffect`는 Passive 비트(0b1000)를, `useLayoutEffect`는 Layout 비트(0b0100)를, `useInsertionEffect`는 Insertion 비트(0b0010)를 가집니다. 의존성이 변경된 Effect에는 추가로 HasEffect 비트(0b0001)가 설정됩니다. 커밋 단계에서는 이 비트마스크로 필터링하여 실행할 Effect를 선별합니다.
 
-  if (isRenderPhaseUpdate(fiber)) {
-    // 렌더 중 setState: 동기적으로 처리
-    enqueueRenderPhaseUpdate(queue, update);
-  } else {
-    const alternate = fiber.alternate;
+중요한 통찰이 하나 있습니다. **의존성이 변경되지 않은 Effect도 원형 리스트에는 등록됩니다.** 단지 HasEffect 비트가 없을 뿐입니다. 커밋 단계는 이 비트를 보고 실행 여부를 결정합니다. 이 설계 덕분에 커밋 단계는 Effect 존재 여부와 실행 여부를 독립적으로 추적할 수 있습니다.
 
-    if (
-      fiber.lanes === NoLanes &&
-      (alternate === null || alternate.lanes === NoLanes)
-    ) {
-      // ★ Eager State 최적화 ★
-      // 현재 Fiber에 대기 중인 업데이트가 없음 = 빠른 경로 가능
-      const lastRenderedReducer = queue.lastRenderedReducer;
-      if (lastRenderedReducer !== null) {
-        let prevDispatcher;
-        try {
-          const currentState: S = (queue.lastRenderedState: any);
-          // 새 상태를 미리 계산
-          const eagerState = lastRenderedReducer(currentState, action);
-
-          update.hasEagerState = true;
-          update.eagerState = eagerState;
-
-          if (is(eagerState, currentState)) {
-            // 새 상태 === 현재 상태 → 렌더 완전 스킵!
-            enqueueConcurrentHookUpdateAndEagerlyBailout(fiber, queue, update);
-            return;  // scheduleUpdateOnFiber 호출 없음!
-          }
-        } catch (error) {
-          // 에러는 무시 (실제 렌더에서 다시 처리됨)
-        }
-      }
-    }
-
-    // 일반 경로: 큐에 추가하고 스케줄링
-    const root = enqueueConcurrentHookUpdate(fiber, queue, update, lane);
-    if (root !== null) {
-      const eventTime = requestEventTime();
-      scheduleUpdateOnFiber(root, fiber, lane, eventTime);
-      entangleTransitionUpdate(root, queue, lane);
-    }
-  }
-}
-```
-
-### Eager State의 조건과 효과
-
-Eager State가 적용되는 조건:
-1. `fiber.lanes === NoLanes` — 현재 Fiber에 대기 중인 업데이트 없음
-2. `alternate.lanes === NoLanes` — 반대편 트리에도 대기 없음
-3. `is(eagerState, currentState)` — 새 상태 === 현재 상태 (`Object.is`)
-
-이 조건이 모두 충족되면 **렌더링 자체가 건너뜁니다**. `scheduleUpdateOnFiber`가 호출되지 않으므로 Fiber Reconciler가 깨어나지 않습니다. 이것이 `setState(sameValue)`가 리렌더를 유발하지 않는 이유입니다.
-
-```jsx
-// 예시: Object.is로 false가 나오는 경우
-const [obj, setObj] = useState({ count: 0 });
-
-// Eager State 적용 안 됨 - 새 객체 참조
-setObj({ count: 0 }); // 리렌더 발생!
-
-// Eager State 적용됨 - 동일 참조
-setObj(obj); // 리렌더 없음
-
-// 함수형 업데이트: 동일 값을 반환해도 렌더 스킵
-setObj(prev => prev); // 리렌더 없음 (is(prev, prev) === true)
-```
-
-### requestUpdateLane: 컨텍스트 기반 우선순위
-
-```javascript
-// react-dom.development.js L25430
-function requestUpdateLane(fiber: Fiber): Lane {
-  const mode = fiber.mode;
-
-  // Legacy 모드: 항상 동기 (최고 우선순위)
-  if ((mode & ConcurrentMode) === NoMode) {
-    return (SyncLane: Lane);
-  }
-
-  // 렌더 중 setState: 현재 렌더의 Lane을 그대로 사용
-  if (
-    (executionContext & RenderContext) !== NoContext &&
-    workInProgressRootRenderLanes !== NoLanes
-  ) {
-    return pickArbitraryLane(workInProgressRootRenderLanes);
-  }
-
-  // startTransition 내부: Transition Lane 할당
-  const isTransition = requestCurrentTransition() !== NoTransition;
-  if (isTransition) {
-    if (currentEventTransitionLane === NoLane) {
-      currentEventTransitionLane = claimNextTransitionLane();
-    }
-    return currentEventTransitionLane;
-  }
-
-  // 이벤트 핸들러 내부: 이벤트 우선순위 반영
-  const updateLane: Lane = (getCurrentUpdatePriority(): any);
-  if (updateLane !== NoLane) {
-    return updateLane;
-  }
-
-  // React 외부 (setTimeout, fetch callback 등): DefaultLane
-  const eventLane: Lane = (getCurrentEventPriority(): any);
-  return eventLane;
-}
-```
-
-같은 `setState`라도 호출 컨텍스트에 따라 다른 Lane이 할당됩니다:
-- 버튼 클릭 이벤트 내부: `InputDiscreteLane` (높은 우선순위)
-- `startTransition` 내부: `TransitionLane` (낮은 우선순위)
-- `setTimeout` 내부: `DefaultLane` (중간 우선순위)
+`updateEffectImpl`은 deps가 변경되지 않았을 때도 이전 cleanup 함수를 새 Effect 노드에 그대로 전달합니다. 이것이 중요한 이유는 deps가 변경되지 않더라도 컴포넌트가 언마운트될 때 cleanup이 실행되어야 하기 때문입니다. cleanup 함수의 참조를 항상 최신 Effect 노드에 보존함으로써 이 케이스를 처리합니다.
 
 ---
 
-## 9. updateReducer: baseQueue와 Lane 필터링
+## 10. Effect 실행 타이밍: 세 개의 층
 
-렌더가 시작되면 `updateReducer`가 Hook의 업데이트 큐를 처리합니다:
+React는 세 종류의 Effect를 서로 다른 타이밍에 실행합니다. 이 구분은 성능과 정확성 사이의 의도적인 트레이드오프입니다.
 
-```javascript
-function updateReducer<S, I, A>(
-  reducer: (S, A) => S,
-  initialArg: I,
-  init?: I => S,
-): [S, Dispatch<A>] {
-  const hook = updateWorkInProgressHook();
-  const queue = hook.queue;
+**useInsertionEffect**는 DOM이 실제로 변경되기 전에 실행됩니다. CSS-in-JS 라이브러리(styled-components, emotion)가 스타일을 주입하는 용도입니다. DOM 변경 전에 스타일이 삽입되어야, 이후 `useLayoutEffect`에서 `getBoundingClientRect()` 같은 API를 호출할 때 올바른 레이아웃 정보를 얻을 수 있습니다. ref도 아직 연결되기 전이므로, DOM 노드에 직접 접근해서는 안 됩니다.
 
-  queue.lastRenderedReducer = reducer;
+**useLayoutEffect**는 DOM 변경이 완료된 후, 브라우저가 화면을 그리기(paint) 전에 동기적으로 실행됩니다. DOM을 읽거나 변경하는 작업에 적합합니다. 예를 들어 특정 요소의 크기를 측정하고 그 결과로 다른 요소를 조정하는 경우, 브라우저가 중간 상태를 그리기 전에 처리해야 깜빡임이 발생하지 않습니다. 하지만 동기 실행이므로 무거운 작업을 여기서 하면 렌더링이 블로킹됩니다.
 
-  const current: Hook = (currentHook: any);
+**useEffect**는 브라우저가 화면을 그린 후, MessageChannel을 통해 비동기적으로 실행됩니다. 네트워크 요청, 이벤트 구독, 외부 라이브러리 초기화처럼 DOM과 무관하거나 즉각적인 반영이 필요 없는 작업에 적합합니다. 가장 나중에 실행되므로 사용자는 Effect가 실행되기 전에 이미 업데이트된 UI를 볼 수 있습니다.
 
-  // 1. baseQueue와 pending 큐 합치기
-  let baseQueue = current.baseQueue;
-  const pendingQueue = queue.pending;
-
-  if (pendingQueue !== null) {
-    if (baseQueue !== null) {
-      // 두 원형 연결 리스트를 합침
-      const baseFirst = baseQueue.next;
-      const pendingFirst = pendingQueue.next;
-      baseQueue.next = pendingFirst;  // baseQueue 끝 → pending 시작
-      pendingQueue.next = baseFirst;  // pending 끝 → baseQueue 시작
-    }
-    current.baseQueue = baseQueue = pendingQueue;
-    queue.pending = null;
-  }
-
-  if (baseQueue !== null) {
-    const first = baseQueue.next;
-    let newState = current.baseState;
-
-    let newBaseState = null;
-    let newBaseQueueFirst = null;
-    let newBaseQueueLast = null;
-    let update = first;
-
-    // 2. 각 업데이트를 Lane 기준으로 처리
-    do {
-      const updateLane = update.lane;
-
-      if (!isSubsetOfLanes(renderLanes, updateLane)) {
-        // ★ 이번 렌더에서 처리하지 않을 업데이트 ★
-        // (낮은 우선순위 업데이트를 높은 우선순위 렌더에서 건너뜀)
-        const clone: Update<S, A> = {
-          lane: updateLane,
-          action: update.action,
-          hasEagerState: update.hasEagerState,
-          eagerState: update.eagerState,
-          next: (null: any),
-        };
-
-        // baseQueue에 보존
-        if (newBaseQueueLast === null) {
-          newBaseQueueFirst = newBaseQueueLast = clone;
-          newBaseState = newState;  // 기준 상태 저장
-        } else {
-          newBaseQueueLast = newBaseQueueLast.next = clone;
-        }
-
-        // 이 Fiber에 해당 Lane 유지 (다음 렌더에서 재처리)
-        currentlyRenderingFiber.lanes = mergeLanes(
-          currentlyRenderingFiber.lanes,
-          updateLane,
-        );
-        markSkippedUpdateLanes(updateLane);
-      } else {
-        // 이번 렌더에서 처리할 업데이트
-        if (newBaseQueueLast !== null) {
-          // 앞에서 건너뛴 업데이트가 있었음
-          // 이후 업데이트는 모두 baseQueue에 포함 (순서 보장)
-          const clone: Update<S, A> = {
-            lane: NoLane,  // Lane을 NoLane으로 → 항상 처리됨
-            action: update.action,
-            hasEagerState: update.hasEagerState,
-            eagerState: update.eagerState,
-            next: (null: any),
-          };
-          newBaseQueueLast = newBaseQueueLast.next = clone;
-        }
-
-        // 업데이트 적용
-        if (update.hasEagerState) {
-          // Eager State가 계산되어 있으면 바로 사용 (재계산 불필요)
-          newState = ((update.eagerState: any): S);
-        } else {
-          const action = update.action;
-          newState = reducer(newState, action);
-        }
-      }
-
-      update = update.next;
-    } while (update !== null && update !== first);
-
-    // 3. 결과 저장
-    if (newBaseQueueLast === null) {
-      newBaseState = newState;  // 건너뛴 업데이트 없음
-    } else {
-      newBaseQueueLast.next = (newBaseQueueFirst: any);  // 원형으로 닫기
-    }
-
-    if (!is(newState, hook.memoizedState)) {
-      markWorkInProgressReceivedUpdate();  // didReceiveUpdate = true
-    }
-
-    hook.memoizedState = newState;
-    hook.baseState = newBaseState;
-    hook.baseQueue = newBaseQueueLast;
-
-    queue.lastRenderedState = newState;
-  }
-
-  const dispatch: Dispatch<A> = (queue.dispatch: any);
-  return [hook.memoizedState, dispatch];
-}
-```
-
-### Lane 필터링의 의미
-
-높은 우선순위 렌더(`SyncLane`)에서 낮은 우선순위 업데이트(`TransitionLane`)를 만나면 건너뜁니다. 이 건너뛴 업데이트들은 `baseQueue`에 보존되어 다음 낮은 우선순위 렌더에서 처리됩니다.
-
-```
-High-Priority Render (SyncLane):
-  update1 (SyncLane)   → 처리: state = 1
-  update2 (TransitionLane) → 건너뜀, baseQueue에 보존
-  update3 (SyncLane)   → 처리: state = 3
-  결과: memoizedState = 3, baseState = 1, baseQueue = [update2, update3]
-
-Low-Priority Render (TransitionLane):
-  update2 (TransitionLane) → 처리: state = 2 (baseState=1에서)
-  update3 (NoLane)     → 처리: state = 3 (항상 처리)
-  결과: memoizedState = 3, baseState = 3, baseQueue = null
-```
+커밋 단계에서 Effect는 전체 트리의 cleanup을 먼저 실행하고, 그 다음 전체 트리의 create를 실행합니다. A의 cleanup → B의 cleanup → A의 create → B의 create 순서입니다. 이 순서가 중요한 이유는 A의 create가 B의 cleanup이 완료된 상태를 전제할 수 있기 때문입니다. 예를 들어 B가 공유 리소스를 해제한 후 A가 그 리소스를 다시 획득하는 시나리오가 안전하게 동작합니다.
 
 ---
 
-## 10. 렌더 중 setState: RE_RENDER_LIMIT = 25
+## 11. Passive Effects와 MessageChannel
 
-렌더 함수 실행 중에 `setState`를 호출하면:
+React 16에서 18로 오면서 `useEffect`의 비동기 스케줄링 방식이 `requestAnimationFrame`에서 **MessageChannel**로 전환됐습니다. 이 변화는 중요한 의미를 가집니다.
 
-```javascript
-function enqueueRenderPhaseUpdate<S, A>(
-  queue: UpdateQueue<S, A>,
-  update: Update<S, A>,
-): void {
-  didScheduleRenderPhaseUpdateDuringThisPass = true;  // 재렌더 트리거
-  didScheduleRenderPhaseUpdate = true;
+`requestAnimationFrame`은 브라우저의 프레임 렌더링 사이클에 연동됩니다. 모니터 주사율에 따라 16.7ms(60fps) 또는 8.3ms(120fps) 간격으로 실행됩니다. 반면 MessageChannel은 단순히 현재 태스크를 완료한 후 다음 마이크로태스크 이후에 실행됩니다. 이 차이로 인해 Passive Effects가 더 예측 가능한 타이밍에 실행되고, 프레임 경계에 묶이지 않아 고주사율 디스플레이에서도 일관된 동작을 보장합니다.
 
-  const alternate = currentlyRenderingFiber.alternate;
-  if (
-    queue.pending === null ||
-    (alternate !== null && queue === alternate.memoizedState?.queue)
-  ) {
-    // 렌더 단계 업데이트로 마킹
-    renderPhaseUpdates = renderPhaseUpdates || new Map();
-    const firstRenderPhaseUpdate = renderPhaseUpdates.get(queue);
-    if (firstRenderPhaseUpdate === undefined) {
-      renderPhaseUpdates.set(queue, update);
-    } else {
-      // 원형 연결 리스트에 추가
-      let lastRenderPhaseUpdate = firstRenderPhaseUpdate;
-      while (lastRenderPhaseUpdate.next !== firstRenderPhaseUpdate) {
-        lastRenderPhaseUpdate = lastRenderPhaseUpdate.next;
-      }
-      lastRenderPhaseUpdate.next = update;
-      update.next = firstRenderPhaseUpdate;
-    }
-  }
-}
-```
-
-`didScheduleRenderPhaseUpdateDuringThisPass`가 true가 되면, `renderWithHooks`의 루프가 재실행됩니다. 단, **최대 25번** 이후에는:
-
-```javascript
-if (numberOfReRenders >= RE_RENDER_LIMIT) {
-  throw new Error(
-    'Too many re-renders. React limits the number of renders to prevent an infinite loop.'
-  );
-}
-```
-
-이 패턴은 파생 상태를 계산하는 컴포넌트에서 유용합니다:
-```jsx
-function DerivedState({ userId }) {
-  const [prevUserId, setPrevUserId] = useState(null);
-  const [user, setUser] = useState(null);
-
-  // 렌더 중 setState (getDerivedStateFromProps 패턴)
-  if (userId !== prevUserId) {
-    setPrevUserId(userId);
-    setUser(null); // userId 변경 시 user 리셋
-  }
-  // 이 경우 재렌더가 일어나지만 무한루프가 아님
-}
-```
+커밋 단계가 끝나면 React는 `scheduleCallback(NormalSchedulerPriority, flushPassiveEffects)`를 호출합니다. 이 호출이 MessageChannel을 통해 비동기로 예약됩니다. 브라우저가 페인트를 완료하고, 이벤트 루프가 현재 태스크를 마친 후, 비로소 `flushPassiveEffects`가 실행되어 useEffect의 cleanup과 create가 순서대로 진행됩니다.
 
 ---
 
-## 11. useEffect 내부: Effect 원형 연결 리스트
+## 12. Strict Mode의 Effect 이중 실행: 버그 조기 감지 장치
 
-### Effect 객체 구조
+개발 모드의 Strict Mode는 컴포넌트를 두 번 렌더한다는 사실은 널리 알려져 있습니다. 덜 알려진 사실은 **Effect도 두 번 실행한다는 것**입니다: create → cleanup → create 순서로.
 
-```typescript
-interface Effect {
-  tag: HookFlags;                           // 비트마스크 플래그
-  create: () => (() => void) | void;        // effect 함수
-  destroy: (() => void) | void;             // cleanup 함수 (create 반환값)
-  deps: Array<mixed> | null;                // 의존성 배열
-  next: Effect;                             // 다음 Effect (원형!)
-}
-```
+이 동작의 목적은 cleanup 함수의 완결성을 강제하는 것입니다. cleanup 없이 EventSource나 WebSocket을 생성하면, 두 번째 create에서 두 개의 연결이 만들어집니다. 이 버그가 개발 단계에서 즉시 드러납니다. cleanup이 제대로 구현된 Effect는 이중 실행 후에도 정확히 하나의 연결만 존재합니다.
 
-HookFlags 비트마스크 (실제 값):
-```javascript
-// react-dom.development.js L6412-6428
-const NoFlags  = 0b0000;  // 0 - 플래그 없음
-const HasEffect = 0b0001; // 1 - 이번 커밋에서 실행 필요
-const Insertion = 0b0010; // 2 - useInsertionEffect
-const Layout    = 0b0100; // 4 - useLayoutEffect
-const Passive   = 0b1000; // 8 - useEffect
-```
-
-`useEffect`는 `Passive | HasEffect = 0b1001 = 9`로 커밋 단계에서 필터링됩니다.
-
-### pushEffect: Effect를 원형 연결 리스트에 추가
-
-```javascript
-// react-dom.development.js L7365
-function pushEffect(
-  tag: HookFlags,
-  create: () => (() => void) | void,
-  destroy: (() => void) | void,
-  deps: Array<mixed> | null,
-): Effect {
-  const effect: Effect = {
-    tag,
-    create,
-    destroy,
-    deps,
-    next: (null: any),
-  };
-
-  let componentUpdateQueue = currentlyRenderingFiber.updateQueue;
-
-  if (componentUpdateQueue === null) {
-    // 첫 번째 Effect: 큐 생성
-    componentUpdateQueue = createFunctionComponentUpdateQueue();
-    // { lastEffect: null, stores: null }
-    currentlyRenderingFiber.updateQueue = componentUpdateQueue;
-    componentUpdateQueue.lastEffect = effect.next = effect;  // 자기 자신 가리킴
-  } else {
-    const lastEffect = componentUpdateQueue.lastEffect;
-    if (lastEffect === null) {
-      componentUpdateQueue.lastEffect = effect.next = effect;
-    } else {
-      const firstEffect = lastEffect.next;  // 현재 첫 번째 저장
-      lastEffect.next = effect;              // 이전 마지막 → 새 effect
-      effect.next = firstEffect;             // 새 effect → 첫 번째
-      componentUpdateQueue.lastEffect = effect;  // lastEffect 갱신
-    }
-  }
-
-  return effect;
-}
-```
-
-3개의 Effect(A, B, C)가 추가된 후:
-```
-updateQueue.lastEffect = C
-    ↓
-C → A → B → C (원형)
-    ↑_____________|
-```
-
-순회: `first = lastEffect.next` (= A)로 시작, `effect !== first`가 false가 될 때까지 반복.
-
-### mountEffect vs updateEffect: deps 비교
-
-```javascript
-// mount: 항상 HasEffect 포함
-function mountEffectImpl(fiberFlags, hookFlags, create, deps) {
-  const hook = mountWorkInProgressHook();
-  const nextDeps = deps === undefined ? null : deps;
-  currentlyRenderingFiber.flags |= fiberFlags;  // Fiber에 플래그 추가
-  hook.memoizedState = pushEffect(
-    HookHasEffect | hookFlags,  // HasEffect 항상 포함
-    create,
-    undefined,  // destroy는 나중에 설정
-    nextDeps,
-  );
-}
-
-// update: deps 비교 후 분기
-function updateEffectImpl(fiberFlags, hookFlags, create, deps) {
-  const hook = updateWorkInProgressHook();
-  const nextDeps = deps === undefined ? null : deps;
-  const prevEffect = currentHook.memoizedState;
-  const destroy = prevEffect.destroy;  // 이전 cleanup 보존!
-
-  if (nextDeps !== null) {
-    const prevDeps = prevEffect.deps;
-    if (areHookInputsEqual(nextDeps, prevDeps)) {
-      // deps 동일: HasEffect 없이 등록 (실행되지 않음)
-      hook.memoizedState = pushEffect(hookFlags, create, destroy, nextDeps);
-      return;  // fiber.flags도 변경 안 함
-    }
-  }
-
-  // deps 변경: HasEffect 포함
-  currentlyRenderingFiber.flags |= fiberFlags;
-  hook.memoizedState = pushEffect(
-    HookHasEffect | hookFlags,
-    create,
-    destroy,     // 이전 cleanup 함수를 새 Effect에 전달
-    nextDeps,
-  );
-}
-```
-
-중요한 통찰: **deps가 동일해도 Effect는 항상 원형 리스트에 등록됩니다**. `HasEffect` 비트가 없을 뿐입니다. 커밋 단계에서 이 비트를 체크하여 실행 여부를 결정합니다.
-
-### deps 비교 알고리즘: Object.is
-
-```javascript
-// react-dom.development.js L15411
-function areHookInputsEqual(
-  nextDeps: Array<mixed>,
-  prevDeps: Array<mixed> | null,
-): boolean {
-  if (prevDeps === null) {
-    return false;  // 이전에 deps가 없었음 → 항상 실행
-  }
-
-  for (let i = 0; i < prevDeps.length && i < nextDeps.length; i++) {
-    if (Object.is(nextDeps[i], prevDeps[i])) {
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
-```
-
-`Object.is`의 특수 케이스:
-```javascript
-Object.is(NaN, NaN)   // true  (=== 과 다름)
-Object.is(0, -0)      // false (=== 과 다름)
-Object.is({}, {})     // false (참조 비교)
-Object.is([], [])     // false (참조 비교)
-```
-
-이것이 `useEffect`의 deps에 객체/배열을 직접 넣으면 항상 재실행되는 이유입니다.
+이것은 React가 "cleanup은 선택사항이 아니라 Effect의 필수 구성요소"라는 철학을 코드로 표현하는 방식입니다. cleanup 없는 Effect를 작성하는 순간 Strict Mode가 경고를 보냅니다.
 
 ---
 
-## 12. Effect 실행 타이밍: 3계층 구조
+## 13. useMemo와 useCallback: 메모이제이션의 실체
 
-React는 세 종류의 Effect를 서로 다른 타이밍에 실행합니다:
+`useMemo`와 `useCallback`은 놀랍도록 단순한 구현을 가지고 있습니다. 각 Hook은 `memoizedState`에 `[값, deps]` 쌍을 저장합니다. 재렌더 시 현재 deps를 이전 deps와 `Object.is`로 비교합니다. 동일하다면 저장된 값을 반환하고, 다르다면 새로 계산하여 저장합니다.
 
-```
-커밋 단계 시작
-│
-├── [Before Mutation Phase]
-│   └── getSnapshotBeforeUpdate (클래스 컴포넌트)
-│
-├── [Mutation Phase] DOM 변경
-│   ├── useInsertionEffect cleanup ← DOM mutation 전에 cleanup
-│   ├── useInsertionEffect create  ← DOM mutation 전에 실행 (CSS-in-JS 스타일 주입)
-│   └── useLayoutEffect cleanup   ← DOM mutation 후에 cleanup만
-│
-├── FiberRoot.current = finishedWork (트리 전환)
-│
-├── [Layout Phase]
-│   ├── useLayoutEffect create    ← DOM 변경 후, 페인트 전 동기 실행
-│   ├── ref attach
-│   └── componentDidMount/Update
-│
-├── requestPaint() ← 브라우저 페인트 기회
-│
-└── [Passive Phase] (비동기 - MessageChannel)
-    ├── useEffect cleanup (전체 트리)
-    └── useEffect create (전체 트리)
-```
+두 Hook의 유일한 차이는 무엇을 저장하느냐입니다. `useMemo`는 팩토리 함수의 실행 결과를, `useCallback`은 함수 자체를 저장합니다. 따라서 `useCallback(fn, deps)`는 `useMemo(() => fn, deps)`와 동일합니다.
 
-### useInsertionEffect: CSS-in-JS를 위한 타이밍
+메모이제이션이 실패하는 가장 흔한 패턴은 deps에 객체나 배열을 직접 넣는 것입니다. `Object.is`는 참조를 비교하므로, 매 렌더마다 새로 생성되는 객체는 내용이 동일해도 "다른 것"으로 판단합니다. 메모이제이션이 의미를 가지려면 deps에 원시값(string, number, boolean)이나 렌더 간 참조가 유지되는 값이 들어가야 합니다.
 
-`useInsertionEffect`는 DOM이 변경되기 전, ref가 attach되기 전에 실행됩니다:
-
-```jsx
-// styled-components, emotion 같은 라이브러리 내부
-function useCSS(rule) {
-  useInsertionEffect(() => {
-    // DOM mutation 전에 <style> 태그 삽입
-    const styleTag = document.createElement('style');
-    styleTag.textContent = rule;
-    document.head.appendChild(styleTag);
-    return () => styleTag.remove();
-  }, [rule]);
-}
-```
-
-이렇게 하면 `useLayoutEffect`에서 `getComputedStyle()`이나 `getBoundingClientRect()`를 호출할 때 최신 스타일이 반영된 값을 얻을 수 있습니다.
+또한 `useMemo`는 메모리를 희생해 계산을 피하는 트레이드오프입니다. 모든 값에 무조건 적용하는 것은 오히려 메모리 압박을 늘리고 코드 가독성을 해칩니다. 실제로 비용이 큰 계산이거나, 참조 동일성이 하위 컴포넌트의 렌더를 방지하는 데 필요한 경우에 사용하는 것이 적절합니다.
 
 ---
 
-## 13. commitHookEffectListMount/Unmount: 커밋 단계의 Effect 처리
+## 14. useRef: 가장 단순하지만 가장 강력한 설계
 
-커밋 단계에서 Effect 원형 리스트를 순회합니다:
+`useRef`의 구현은 Hook 시스템에서 가장 단순합니다. 마운트 시 `{ current: initialValue }` 객체를 생성해 저장합니다. 업데이트 시에는 `initialValue`를 완전히 무시하고 최초에 생성한 객체를 그대로 반환합니다.
 
-### Unmount: cleanup 실행
+이 단순성이 강력함의 근원입니다. `useRef`가 반환하는 객체는 컴포넌트의 생애 동안 동일한 참조를 유지합니다. React가 상태 변경을 감지하거나 리렌더를 유발하는 메커니즘과 완전히 분리되어 있습니다. `ref.current`에 어떤 값을 저장하든 React는 알지 못하고, 따라서 리렌더를 유발하지 않습니다.
 
-```javascript
-// react-dom.development.js L14738
-function commitHookEffectListUnmount(
-  flags: HookFlags,
-  finishedWork: Fiber,
-  nearestMountedAncestor: Fiber | null,
-) {
-  const updateQueue: FunctionComponentUpdateQueue | null =
-    (finishedWork.updateQueue: any);
-  const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
-
-  if (lastEffect !== null) {
-    const firstEffect = lastEffect.next;
-    let effect = firstEffect;
-
-    do {
-      if ((effect.tag & flags) === flags) {  // 비트마스크 일치 확인
-        const destroy = effect.destroy;
-        effect.destroy = undefined;  // ★ 즉시 초기화 (중복 호출 방지)
-
-        if (destroy !== undefined) {
-          safelyCallDestroy(finishedWork, nearestMountedAncestor, destroy);
-        }
-      }
-      effect = effect.next;
-    } while (effect !== firstEffect);
-  }
-}
-```
-
-### Mount: effect 실행 및 destroy 저장
-
-```javascript
-// react-dom.development.js L14790
-function commitHookEffectListMount(flags: HookFlags, finishedWork: Fiber) {
-  const updateQueue: FunctionComponentUpdateQueue | null =
-    (finishedWork.updateQueue: any);
-  const lastEffect = updateQueue !== null ? updateQueue.lastEffect : null;
-
-  if (lastEffect !== null) {
-    const firstEffect = lastEffect.next;
-    let effect = firstEffect;
-
-    do {
-      if ((effect.tag & flags) === flags) {
-        const create = effect.create;
-        effect.destroy = create();  // ★ 반환값이 cleanup 함수
-      }
-      effect = effect.next;
-    } while (effect !== firstEffect);
-  }
-}
-```
-
-### cleanup 실행 순서: 전체 트리 unmount → 전체 트리 mount
-
-`flushPassiveEffectsImpl`에서:
-```javascript
-// react-dom.development.js L19220
-function flushPassiveEffectsImpl() {
-  // 전체 트리의 모든 cleanup 먼저
-  commitPassiveUnmountEffects(root.current);
-
-  // 그 다음 전체 트리의 모든 create
-  commitPassiveMountEffects(root, root.current, lanes, transitions);
-
-  return true;
-}
-```
-
-이 순서가 중요한 이유: A의 cleanup → B의 cleanup → A의 create → B의 create 순서로 실행됩니다. A의 create가 B의 cleanup이 완료된 상태를 전제로 할 수 있습니다.
-
-### destroy의 생명주기
-
-```
-마운트:    effect.destroy = undefined
-           create() 실행 → effect.destroy = cleanup 함수
-
-다음 렌더: updateEffectImpl에서 prevEffect.destroy를 새 Effect에 복사
-           새 effect.destroy = 이전 cleanup 함수
-
-커밋:      commitHookEffectListUnmount:
-             destroy = effect.destroy
-             effect.destroy = undefined   ← 즉시 null화
-             safelyCallDestroy(destroy)   ← cleanup 실행
-           commitHookEffectListMount:
-             effect.destroy = create()    ← 새 cleanup 저장
-```
+커밋 단계에서 DOM ref의 경우, React는 `commitAttachRef`를 통해 `ref.current`에 실제 DOM 노드를 설정합니다. Callback ref라면 함수를 직접 호출합니다. 언마운트 시에는 `ref.current = null`로 초기화합니다. 이 타이밍이 `useLayoutEffect`와 동일한 Layout 단계여서, `useLayoutEffect` 안에서 ref에 안전하게 접근할 수 있습니다.
 
 ---
 
-## 14. Passive Effects 비동기 스케줄링: MessageChannel
+## 15. Rules of Hooks: 제약의 이유
 
-React 16에서는 `requestAnimationFrame`을 사용했지만, React 18에서는 **MessageChannel**로 전환했습니다:
+Hooks의 두 가지 규칙—최상위 레벨에서만 호출, 함수 컴포넌트(또는 custom Hook) 안에서만 호출—은 단순한 관례가 아닙니다. 앞서 살펴본 Hook 연결 리스트 구조에서 직접 도출되는 물리적 제약입니다.
 
-```javascript
-// react-dom.development.js L18941 (commitRootImpl 내)
-function commitRootImpl(root, ...) {
-  // 동기 작업들...
-  commitMutationEffects(root, finishedWork, lanes);
-  root.current = finishedWork;  // 트리 교체
-  commitLayoutEffects(finishedWork, root, lanes);
+Hook 연결 리스트는 순서에 의존합니다. React는 "n번째 Hook은 무조건 이전 렌더의 n번째 Hook과 같은 것"이라고 가정합니다. 이름을 저장하지 않으니, 순서가 유일한 식별자입니다. 조건문이나 반복문 안에서 Hook을 호출하면 렌더마다 Hook의 개수와 순서가 달라질 수 있어, 각 Hook 노드에서 읽어오는 데이터가 뒤섞입니다.
 
-  // Passive Effects는 비동기로 스케줄
-  if (rootDoesHavePassiveEffects) {
-    rootDoesHavePassiveEffects = false;
-    rootWithPendingPassiveEffects = root;
-    pendingPassiveEffectsLanes = lanes;
-    scheduleCallback(NormalSchedulerPriority, () => {
-      flushPassiveEffects();  // MessageChannel 통해 비동기 실행
-      return null;
-    });
-  }
+개발 모드에서 React는 이를 런타임에도 감지합니다. 마운트 시 각 Hook의 이름을 순서대로 기록해두고, 이후 렌더에서 같은 위치에서 다른 Hook이 호출되면 경고를 출력합니다. Hook 개수가 줄면 "Rendered fewer hooks than expected", 늘면 "Rendered more hooks than during the previous render" 에러가 발생합니다.
 
-  // 페인트 기회
-  requestPaint();
-}
-```
+두 번째 규칙—함수 컴포넌트 안에서만 호출—은 Dispatcher 패턴으로 강제됩니다. 렌더 밖에서는 Dispatcher가 에러를 던지는 `ContextOnlyDispatcher`이므로, 어떤 Hook을 호출해도 즉시 에러가 발생합니다.
 
-MessageChannel 기반 비동기:
-```
-commitRoot() [동기]
-  └── scheduleCallback(NormalPriority, flushPassiveEffects)
-        └── MessageChannel.postMessage()
-              [이벤트 루프 - 현재 태스크 완료 후]
-              └── message event 처리
-                    └── flushPassiveEffects()
-                          ├── commitPassiveUnmountEffects()
-                          └── commitPassiveMountEffects()
-```
-
-### flushSync가 Passive Effects를 먼저 처리하는 이유
-
-```javascript
-// react-dom.development.js L18336
-function flushSync(fn) {
-  // 이전 렌더의 passive effects가 남아있으면 먼저 처리
-  if (
-    rootWithPendingPassiveEffects !== null &&
-    rootWithPendingPassiveEffects.tag === LegacyRoot &&
-    (executionContext & (RenderContext | CommitContext)) === NoContext
-  ) {
-    flushPassiveEffects();
-  }
-  // ...
-}
-```
-
-이전 `useEffect`에서 `setState`를 호출했고 그 결과가 `flushSync`로 실행되는 코드에 필요한 경우, passive effects를 먼저 처리하지 않으면 stale 상태를 읽게 됩니다.
+`eslint-plugin-react-hooks`는 이 규칙들을 컴파일 타임에 정적 분석으로 감지합니다. 런타임 에러를 기다릴 필요 없이 코드를 작성하는 시점에 위반을 잡아줍니다.
 
 ---
 
-## 15. Strict Mode의 Effect 이중 실행
+## 16. Concurrent Mode와 Tearing: useSyncExternalStore의 필요성
 
-개발 모드의 Strict Mode에서 컴포넌트를 두 번 렌더하는 것은 잘 알려진 사실이지만, **Effect도 두 번 실행**됩니다:
+Concurrent Mode의 핵심 특성은 렌더가 중단될 수 있다는 것입니다. 이 특성이 외부 스토어(Redux, Zustand 등)와 결합되면 **Tearing** 문제가 발생합니다.
 
-```javascript
-// react-dom.development.js L19497
-function commitDoubleInvokeEffectsInDEV(
-  fiber: Fiber,
-  hasPassiveEffects: boolean,
-) {
-  // Layout effects: unmount → mount
-  invokeEffectsInDev(fiber, MountLayoutDev, invokeLayoutEffectUnmountInDEV);
-  invokeEffectsInDev(fiber, MountLayoutDev, invokeLayoutEffectMountInDEV);
+비유로 설명하면 이렇습니다. 책을 읽는 도중 누군가가 몰래 페이지를 바꿔치기 합니다. 앞부분은 바뀌기 전의 내용을, 뒷부분은 바뀐 후의 내용을 읽게 됩니다. 일관성이 깨진 책이 됩니다.
 
-  // Passive effects: unmount → mount
-  if (hasPassiveEffects) {
-    invokeEffectsInDev(fiber, MountPassiveDev, invokePassiveEffectUnmountInDEV);
-    invokeEffectsInDev(fiber, MountPassiveDev, invokePassiveEffectMountInDEV);
-  }
-}
-```
+Concurrent 렌더링에서 이 상황이 발생하면: 컴포넌트 A를 렌더하면서 스토어 값 10을 읽습니다. 렌더가 중단됩니다. 그 사이 외부에서 스토어 값이 20으로 변경됩니다. 렌더가 재개되면 컴포넌트 B는 값 20을 읽습니다. 화면에는 A는 10, B는 20이 표시됩니다. 같은 렌더 사이클에서 서로 다른 시점의 스토어 값을 반영한 UI가 그려집니다.
 
-실행 순서:
-```
-마운트 (Strict Mode)
-  1. useEffect create  ← 첫 번째 실행
-  2. useEffect cleanup ← Strict Mode 이중 실행 (unmount)
-  3. useEffect create  ← Strict Mode 이중 실행 (remount)
-```
-
-이것이 왜 중요한가: cleanup이 제대로 구현되지 않은 effect를 즉시 감지할 수 있습니다.
-
-```jsx
-// 버그: EventSource를 정리하지 않음
-useEffect(() => {
-  const es = new EventSource('/stream');
-  es.onmessage = handleMessage;
-  // cleanup 없음!
-}, []);
-// Strict Mode에서 두 번 실행 → 두 개의 EventSource 생성 → 버그 조기 발견!
-
-// 올바른 구현
-useEffect(() => {
-  const es = new EventSource('/stream');
-  es.onmessage = handleMessage;
-  return () => es.close();  // cleanup 필수
-}, []);
-```
+`useSyncExternalStore`는 이를 해결하는 공식 API입니다. 핵심 메커니즘은 커밋 직전의 일관성 검사입니다. 렌더가 완료되고 DOM에 커밋하기 직전, 렌더 중에 읽었던 스냅샷이 여전히 최신인지 확인합니다. 변경되었다면 동기적으로 재렌더를 트리거합니다. 이 검사가 Tearing을 방지하는 안전망입니다.
 
 ---
 
-## 16. useMemo / useCallback: 메모이제이션의 실제 구현
+## 17. 전체 그림: setState에서 화면까지
 
-### useMemo
+지금까지 살펴본 조각들을 하나의 흐름으로 이어보면:
 
-```javascript
-// mount
-function mountMemo<T>(nextCreate: () => T, deps: Array<mixed> | void | null): T {
-  const hook = mountWorkInProgressHook();
-  const nextDeps = deps === undefined ? null : deps;
-  const nextValue = nextCreate();  // 팩토리 함수 즉시 실행
-  hook.memoizedState = [nextValue, nextDeps];  // [값, deps] 쌍으로 저장
-  return nextValue;
-}
+사용자가 버튼을 클릭해 `setState(newValue)`를 호출합니다. `dispatchSetState`가 실행되어 현재 컨텍스트(이벤트 핸들러)에서 `InputDiscreteLane`을 할당받습니다. Eager State 최적화를 시도해 새 값이 현재 값과 동일하다면 즉시 종료합니다. 다르다면 업데이트를 큐에 추가하고 `scheduleUpdateOnFiber`로 렌더를 예약합니다.
 
-// update
-function updateMemo<T>(nextCreate: () => T, deps: Array<mixed> | void | null): T {
-  const hook = updateWorkInProgressHook();
-  const nextDeps = deps === undefined ? null : deps;
-  const prevState = hook.memoizedState;
+React 스케줄러가 우선순위에 따라 `performConcurrentWorkOnRoot`를 실행합니다. `renderWithHooks`가 Dispatcher를 설정하고 컴포넌트 함수를 실행합니다. `updateReducer`가 업데이트 큐를 처리하며 Lane 필터링으로 이번 렌더에서 적용할 업데이트를 선별합니다. 새 상태가 계산됩니다.
 
-  if (prevState !== null) {
-    if (nextDeps !== null) {
-      const prevDeps: Array<mixed> | null = prevState[1];
-      if (areHookInputsEqual(nextDeps, prevDeps)) {
-        return prevState[0];  // ★ 캐시된 값 반환
-      }
-    }
-  }
-
-  const nextValue = nextCreate();  // 새로 계산
-  hook.memoizedState = [nextValue, nextDeps];
-  return nextValue;
-}
-```
-
-### useCallback
-
-```javascript
-// mount
-function mountCallback<T>(callback: T, deps: Array<mixed> | void | null): T {
-  const hook = mountWorkInProgressHook();
-  const nextDeps = deps === undefined ? null : deps;
-  hook.memoizedState = [callback, nextDeps];  // 함수 자체를 저장
-  return callback;
-}
-```
-
-`useMemo`와 `useCallback`의 유일한 차이:
-- `useMemo`: 팩토리 함수를 실행한 결과를 저장
-- `useCallback`: 함수 자체를 저장
-
-```javascript
-useCallback(fn, deps)
-// 완전히 동일
-useMemo(() => fn, deps)
-```
-
-### 메모이제이션의 한계: 참조 동일성
-
-```jsx
-function Parent() {
-  const [count, setCount] = useState(0);
-
-  // 문제: 매 렌더마다 새 객체
-  const config = { threshold: 0.5, root: null };
-
-  // Object.is({...}, {...}) === false → 매번 재실행
-  const result = useMemo(
-    () => expensiveCalc(config),
-    [config]  // 항상 새 객체 참조 → 항상 재실행됨
-  );
-
-  // 해결책: 원시값을 deps로 사용
-  const result2 = useMemo(
-    () => expensiveCalc({ threshold: 0.5, root: null }),
-    []  // 변하지 않는 값
-  );
-}
-```
+`commitRoot`가 시작됩니다. Mutation Phase에서 `useInsertionEffect`가 실행되고 DOM이 변경됩니다. `root.current`가 새 Fiber 트리로 교체됩니다. Layout Phase에서 `useLayoutEffect`가 실행되고 ref가 연결됩니다. 브라우저가 화면을 그립니다. 이후 MessageChannel을 통해 비동기적으로 `flushPassiveEffects`가 실행되어 전체 트리의 `useEffect` cleanup과 create가 순서대로 처리됩니다.
 
 ---
 
-## 17. useRef: 가장 단순하지만 가장 강력한 Hook
+## 마치며: 제약이 자유를 만드는 방식
 
-```javascript
-// mount
-function mountRef<T>(initialValue: T): {current: T} {
-  const hook = mountWorkInProgressHook();
-  const ref = {current: initialValue};
-  hook.memoizedState = ref;  // 객체를 저장
-  return ref;                // 동일한 객체 반환
-}
+Hook은 제약을 통해 자유를 제공합니다. 순서를 강제함으로써 배열 인덱스 없이도 Hook을 추적할 수 있게 됩니다. Dispatcher를 렌더 외부에서 비활성화함으로써 잘못된 사용을 컴파일 타임이 아닌 런타임에 즉시 잡아냅니다. Effect를 원형 리스트로 관리함으로써 커밋 단계에서 효율적으로 순회합니다.
 
-// update - initialValue를 완전히 무시!
-function updateRef<T>(initialValue: T): {current: T} {
-  const hook = updateWorkInProgressHook();
-  return hook.memoizedState;  // 최초 생성 객체 그대로
-}
-```
+"Hook은 클로저 기반의 상태 관리"라는 직관은 개발자 경험 측면의 설명이지, 내부 구현의 설명이 아닙니다. 실제로 상태는 Fiber의 `memoizedState`에 살고, `setState`는 Fiber와 큐에 바인딩된 함수이며, Effect는 비트마스크로 분류된 원형 리스트의 노드입니다.
 
-`updateRef`는 `initialValue`를 무시합니다. 이것이 `useRef`의 핵심 — 렌더 간 동일한 객체 참조를 제공합니다.
+이 구조를 이해하면 다음 질문들의 답이 자명해집니다: 왜 조건문 안에서 Hook을 쓸 수 없는가, 왜 `setState(sameValue)`가 리렌더를 유발하지 않는가, 왜 `useLayoutEffect`와 `useEffect`의 타이밍이 다른가, 왜 Concurrent Mode에서 외부 스토어를 직접 읽으면 위험한가.
 
-### Callback ref vs Object ref
-
-```javascript
-// react-dom.development.js L23662
-function commitAttachRef(finishedWork: Fiber) {
-  const ref = finishedWork.ref;
-  if (ref !== null) {
-    const instance = finishedWork.stateNode;
-    const instanceToUse = getPublicInstance(instance);
-
-    if (typeof ref === 'function') {
-      // Callback ref: 함수 직접 호출
-      ref(instanceToUse);
-    } else {
-      // Object ref: .current에 할당
-      ref.current = instanceToUse;
-    }
-  }
-}
-```
-
-언마운트 시:
-```javascript
-function safelyDetachRef(current: Fiber, nearestMountedAncestor: Fiber | null) {
-  const ref = current.ref;
-  if (ref !== null) {
-    if (typeof ref === 'function') {
-      ref(null);         // callback ref에 null 전달
-    } else {
-      ref.current = null; // object ref 초기화
-    }
-  }
-}
-```
-
-### useImperativeHandle: useLayoutEffect로 구현
-
-```javascript
-function mountImperativeHandle<T>(
-  ref: {current: T | null} | ((inst: T) => mixed) | null | void,
-  create: () => T,
-  deps: Array<mixed> | void | null,
-): void {
-  // deps에 ref를 추가
-  const effectDeps =
-    deps !== null && deps !== undefined ? deps.concat([ref]) : null;
-
-  // ★ Layout 타이밍 = useLayoutEffect와 동일
-  return mountEffectImpl(
-    UpdateEffect,
-    HookLayout,                                        // Layout 플래그
-    imperativeHandleEffect.bind(null, create, ref),
-    effectDeps,
-  );
-}
-
-function imperativeHandleEffect<T>(create: () => T, ref: ...) {
-  if (typeof ref === 'function') {
-    const inst = create();
-    ref(inst);
-    return () => { ref(null); };
-  } else if (ref !== null && ref !== undefined) {
-    const inst = create();
-    ref.current = inst;
-    return () => { ref.current = null; };
-  }
-}
-```
-
-커밋 타이밍에서의 순서:
-```
-Layout Phase
-  1. useLayoutEffect cleanup
-  2. useImperativeHandle cleanup
-  3. useLayoutEffect create
-  4. useImperativeHandle create ← 부모가 자식 ref를 읽기 전에 설정 완료
-  5. ref attach (commitAttachRef)
-```
+다음 편에서는 이 Hook들의 우선순위를 결정하는 **Lane 스케줄링 시스템**을 다룹니다. 31개의 비트로 표현되는 우선순위 채널, Entanglement, 기아(starvation) 방지 알고리즘을 추적합니다.
 
 ---
 
-## 18. useContext: 컨텍스트 의존성 추적
-
-```javascript
-function readContext<T>(context: ReactContext<T>): T {
-  const value = isPrimaryRenderer
-    ? context._currentValue
-    : context._currentValue2;
-
-  // 이미 이 컨텍스트를 읽었는지 확인
-  if (lastFullyObservedContext === context) {
-    // 캐시된 값 사용
-  } else {
-    const contextItem = {
-      context: ((context: any): ReactContext<mixed>),
-      memoizedValue: value,
-      next: null,
-    };
-
-    if (lastContextDependency === null) {
-      // 첫 번째 컨텍스트 의존성
-      lastContextDependency = contextItem;
-      currentlyRenderingFiber.dependencies = {
-        lanes: NoLanes,
-        firstContext: contextItem,
-      };
-    } else {
-      // 연결 리스트에 추가
-      lastContextDependency = lastContextDependency.next = contextItem;
-    }
-  }
-
-  return value;
-}
-```
-
-컨텍스트 변경 시 `propagateContextChange`가 의존성 체인을 순회하여 관련 Fiber에 `lanes`를 설정합니다. 이 Fiber들은 다음 렌더 사이클에서 자동으로 재렌더됩니다.
-
----
-
-## 19. Rules of Hooks: 정적 분석과 런타임 강제
-
-### 런타임 강제: DEV 모드의 Hook 순서 추적
-
-```javascript
-// 마운트 시 Hook 이름 기록
-function mountHookTypesDev() {
-  const hookName = currentHookNameInDev;
-  if (hookTypesDev === null) {
-    hookTypesDev = [hookName];    // ['useState']
-  } else {
-    hookTypesDev.push(hookName);  // ['useState', 'useEffect', 'useMemo']
-  }
-}
-
-// 업데이트 시 이름 비교
-function updateHookTypesDev() {
-  const hookName = currentHookNameInDev;
-  if (hookTypesDev !== null) {
-    hookTypesUpdateIndexDev++;
-    // hookTypesDev[i] vs 현재 hookName 비교
-    if (hookTypesDev[hookTypesUpdateIndexDev] !== hookName) {
-      warnOnHookMismatchInDev(hookName);
-    }
-  }
-}
-```
-
-불일치 감지 시 출력되는 경고:
-```
-React has detected a change in the order of Hooks called by MyComponent.
-
-   Previous render            Next render
-   ------------------------------------------------------
-1. useState                    useState
-2. useEffect                   useCallback  <-- 불일치!
-   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-This will lead to bugs and errors if not fixed.
-```
-
-### 에러 발생 조건
-
-```javascript
-// "Rendered more hooks": 이전보다 Hook이 많음
-if (nextCurrentHook === null) {
-  throw new Error('Rendered more hooks than during the previous render.');
-}
-
-// "Rendered fewer hooks": 이전보다 Hook이 적음
-const didRenderTooFewHooks =
-  currentHook !== null && currentHook.next !== null;
-if (didRenderTooFewHooks) {
-  throw new Error('Rendered fewer hooks than expected.');
-}
-```
-
-### 왜 순서가 불변이어야 하는가
-
-```
-마운트 시 Hook 체인:
-Hook_1(useState=0) → Hook_2(useEffect=fn) → Hook_3(useState="hi")
-
-업데이트 시 (조건부 useEffect 건너뜀):
-읽기: Hook_1(useState=0)  ✓
-건너뜀: useEffect
-읽기: Hook_2(useEffect 데이터) ← 실제로는 이전 useEffect의 memoizedState!
-결과: 세 번째 useState가 잘못된 값을 읽음 → 버그!
-```
-
-### 정적 분석: eslint-plugin-react-hooks
-
-런타임 에러 외에도, ESLint 플러그인이 컴파일 타임에 감지합니다:
-
-```javascript
-// 정적 분석으로 감지되는 패턴들
-function Component({ condition }) {
-  // ❌ 조건부 Hook
-  if (condition) {
-    const [x] = useState(0); // ESLint 에러
-  }
-
-  // ❌ 반복문 내 Hook
-  for (let i = 0; i < 3; i++) {
-    useEffect(() => {}, []); // ESLint 에러
-  }
-
-  // ❌ 중첩 함수 내 Hook
-  function helper() {
-    const [y] = useState(0); // ESLint 에러
-  }
-
-  // ✓ 최상위 레벨
-  const [z] = useState(0);
-}
-```
-
----
-
-## 20. Concurrent Mode와 Tearing: useSyncExternalStore
-
-Concurrent Mode에서는 렌더가 중단될 수 있습니다. 외부 스토어(Redux, Zustand 등)가 렌더 도중 변경되면 **Tearing** 현상이 발생합니다:
-
-```
-Concurrent 렌더 시작
-  컴포넌트 A 렌더 → 스토어 값 읽기: count = 10
-  [더 높은 우선순위 작업 → 렌더 중단]
-  외부: store.count = 20
-  렌더 재개
-  컴포넌트 B 렌더 → 스토어 값 읽기: count = 20
-
-최종 화면: A는 10, B는 20 → Tearing!
-```
-
-`useSyncExternalStore`는 이를 해결합니다:
-
-```javascript
-// react-dom.development.js L15957
-function mountSyncExternalStore<T>(
-  subscribe: (() => void) => () => void,
-  getSnapshot: () => T,
-  getServerSnapshot?: () => T,
-): T {
-  const fiber = currentlyRenderingFiber;
-  const hook = mountWorkInProgressHook();
-
-  // 1. 현재 스냅샷 읽기
-  const nextSnapshot = getSnapshot();
-
-  hook.memoizedState = nextSnapshot;
-  const inst = {value: nextSnapshot, getSnapshot};
-  hook.queue = inst;
-
-  // 2. 변경 구독
-  mountEffect(
-    subscribeToStore.bind(null, fiber, inst, subscribe),
-    [subscribe],
-  );
-
-  // 3. ★ 커밋 직전 일관성 검사 (Tearing 방지 핵심)
-  if (!includesBlockingLane(root, renderLanes)) {
-    pushStoreConsistencyCheck(fiber, getSnapshot, nextSnapshot);
-  }
-
-  return nextSnapshot;
-}
-```
-
-커밋 직전 일관성 검사:
-```javascript
-function checkIfSnapshotChanged(inst: StoreInstance<any>): boolean {
-  const latestGetSnapshot = inst.getSnapshot;
-  const prevValue = inst.value;
-  try {
-    const nextValue = latestGetSnapshot();
-    return !is(prevValue, nextValue);  // 렌더 중 변경 감지!
-  } catch (error) {
-    return true;
-  }
-}
-```
-
-렌더 중 스토어가 변경되었으면 동기적으로 재렌더합니다. 이것이 Tearing 없이 외부 스토어를 읽는 안전한 방법입니다.
-
----
-
-## 21. useId: 서버-클라이언트 일관성을 위한 결정론적 ID
-
-```javascript
-// react-dom.development.js L16569
-function mountId(): string {
-  const hook = mountWorkInProgressHook();
-  const root = getWorkInProgressRoot();
-  const identifierPrefix = root.identifierPrefix;
-
-  let id;
-  if (getIsHydrating()) {
-    // ★ 서버 사이드: Fiber 트리 위치 기반 결정론적 ID
-    const treeId = getTreeId();  // Fiber 경로를 비트 연산으로 인코딩
-    id = ':' + identifierPrefix + 'R' + treeId;
-
-    // 같은 컴포넌트 내 여러 useId
-    const localId = localIdCounter++;
-    if (localId > 0) {
-      id += 'H' + localId.toString(32);  // 32진수로 인코딩
-    }
-    id += ':';
-    // 예: ":R1:" ":R1H1:" ":R1H2:"
-  } else {
-    // 클라이언트 사이드 전용: 전역 카운터
-    const globalClientId = globalClientIdCounter++;
-    id = ':' + identifierPrefix + 'r' + globalClientId.toString(32) + ':';
-    // 예: ":r0:" ":r1:" ":r2:"
-  }
-
-  hook.memoizedState = id;
-  return id;
-}
-
-// 업데이트: ID는 변경되지 않음
-function updateId(): string {
-  const hook = updateWorkInProgressHook();
-  return hook.memoizedState;  // 한 번 생성 후 고정
-}
-```
-
-서버와 클라이언트가 동일한 Fiber 트리 구조를 가지면 `getTreeId()`가 동일한 값을 반환합니다. 이것이 Hydration 시 ID 불일치 없이 동작하는 원리입니다.
-
----
-
-## 22. Lane 시스템과 Hook 통합
-
-Lane은 업데이트의 "우선순위 채널"입니다. Hook은 `dispatchSetState`를 통해 Lane 시스템과 통합됩니다:
-
-```javascript
-// 실제 Lane 비트마스크 값
-const SyncLane            = 0b0000000000000000000000000000001;
-const InputContinuousLane = 0b0000000000000000000000000000100;
-const DefaultLane         = 0b0000000000000000000000000010000;
-const TransitionLane1     = 0b0000000000000000000000001000000;
-// ... TransitionLane16 까지
-const IdleLane            = 0b0100000000000000000000000000000;
-```
-
-```jsx
-function SearchComponent() {
-  const [immediate, setImmediate] = useState('');    // 입력: InputContinuousLane
-  const [deferred, setDeferred] = useState('');      // 전환: TransitionLane
-
-  const handleChange = (e) => {
-    // 긴급 업데이트: InputContinuousLane
-    setImmediate(e.target.value);
-
-    // 전환 업데이트: TransitionLane (낮은 우선순위)
-    startTransition(() => {
-      setDeferred(e.target.value);
-    });
-  };
-  // immediate는 즉시 반영, deferred는 CPU 여유가 있을 때 처리
-}
-```
-
-`markUpdateLaneFromFiberToRoot`는 Lane을 Fiber에서 루트까지 버블링합니다:
-```javascript
-function markUpdateLaneFromFiberToRoot(sourceFiber: Fiber, lane: Lane) {
-  sourceFiber.lanes = mergeLanes(sourceFiber.lanes, lane);
-  let alternate = sourceFiber.alternate;
-  if (alternate !== null) {
-    alternate.lanes = mergeLanes(alternate.lanes, lane);
-  }
-
-  // 루트까지 childLanes 업데이트
-  let node = sourceFiber;
-  let parent = sourceFiber.return;
-  while (parent !== null) {
-    parent.childLanes = mergeLanes(parent.childLanes, lane);
-    alternate = parent.alternate;
-    if (alternate !== null) {
-      alternate.childLanes = mergeLanes(alternate.childLanes, lane);
-    }
-    node = parent;
-    parent = parent.return;
-  }
-
-  if (node.tag === HostRoot) {
-    return node.stateNode;  // FiberRoot 반환
-  }
-}
-```
-
----
-
-## 23. 전체 흐름: 컴포넌트 렌더에서 화면까지
-
-모든 조각을 연결해봅시다:
-
-```
-사용자: setState(newValue) 호출
-│
-├── [dispatchSetState]
-│   ├── requestUpdateLane(fiber) → Lane 결정
-│   ├── Eager State 체크
-│   │   └── is(eagerState, currentState) → true? 종료 (렌더 없음!)
-│   └── enqueueConcurrentHookUpdate(fiber, queue, update, lane)
-│       └── scheduleUpdateOnFiber(root, fiber, lane, eventTime)
-│
-├── [ensureRootIsScheduled]
-│   └── scheduleCallback(priority, performConcurrentWorkOnRoot)
-│
-├── [performConcurrentWorkOnRoot - MessageChannel 이후]
-│   └── renderRootConcurrent()
-│       └── workLoopConcurrent()
-│           └── performUnitOfWork(workInProgress)
-│               └── beginWork(workInProgress)
-│                   └── renderWithHooks(current, wip, Component, ...)
-│                       ├── Dispatcher 설정 (HooksDispatcherOnUpdate)
-│                       ├── Component(props) 실행
-│                       │   └── useState() → updateReducer()
-│                       │       ├── baseQueue + pending 합치기
-│                       │       ├── Lane 필터링으로 적용할 업데이트 선택
-│                       │       └── reducer 적용 → newState
-│                       └── Dispatcher를 ContextOnlyDispatcher로 리셋
-│
-├── [commitRoot]
-│   ├── [Before Mutation Phase]
-│   │   └── getSnapshotBeforeUpdate (클래스 컴포넌트)
-│   │
-│   ├── [Mutation Phase]
-│   │   ├── useInsertionEffect cleanup
-│   │   ├── useInsertionEffect create (CSS-in-JS 스타일 주입)
-│   │   ├── DOM 변경 (appendChild, setAttribute 등)
-│   │   └── useLayoutEffect cleanup
-│   │
-│   ├── root.current = finishedWork (트리 교체)
-│   │
-│   ├── [Layout Phase]
-│   │   ├── useLayoutEffect create (DOM 측정 가능)
-│   │   ├── useImperativeHandle
-│   │   └── ref attach
-│   │
-│   └── [Passive Effects 스케줄]
-│       └── scheduleCallback(NormalPriority, flushPassiveEffects)
-│
-├── 브라우저 페인트
-│
-└── [flushPassiveEffects - MessageChannel 이후]
-    ├── commitPassiveUnmountEffects (전체 트리 cleanup)
-    └── commitPassiveMountEffects (전체 트리 useEffect)
-```
-
----
-
-## 마치며: "Hook은 클로저가 아니다"
-
-Hook을 처음 접하면 "클로저 기반의 상태 관리"라고 이해하기 쉽습니다. 하지만 내부를 들여다보면 전혀 다릅니다.
-
-Hook의 상태는 **클로저에 캡처된 변수가 아니라 Fiber 노드의 memoizedState에 저장된 연결 리스트**입니다. `useState`가 반환하는 `setState`는 `dispatchSetState`를 Fiber와 큐에 바인딩한 함수이며, 각 `useEffect`는 Effect 원형 연결 리스트의 한 노드입니다.
-
-Dispatcher 패턴은 동일한 `useState` 호출이 마운트인지 업데이트인지에 따라 완전히 다른 구현을 실행하게 해줍니다. Rules of Hooks는 이 연결 리스트의 순서가 렌더 간 일치해야 한다는 불변성에서 비롯됩니다.
-
-Concurrent Mode에서의 Tearing 방지는 `useSyncExternalStore`의 커밋 직전 일관성 검사로, Hook이 단순한 상태 저장을 넘어 React의 Concurrent 렌더링 모델과 얼마나 깊이 통합되어 있는지를 보여줍니다.
-
-다음 편에서는 이 Hook들이 속한 Fiber의 우선순위를 결정하는 **Lane 스케줄링 시스템** — 비트마스크로 표현된 31개의 우선순위 채널, Entanglement, 기아 방지 알고리즘을 소스 코드로 추적합니다.
-
----
-
-> **참조 파일**: `packages/react-reconciler/src/ReactFiberHooks.js`, `packages/react-reconciler/src/ReactFiberCommitWork.js`, `packages/react/src/ReactCurrentDispatcher.js`
->
-> **시리즈 링크**:
+> **시리즈 링크**
 > - [1편: 패키지 계층 구조](react-architecture-01-package-structure.md)
 > - [2편: Fiber 아키텍처](react-architecture-02-fiber-architecture.md)
 > - **3편: Hooks 시스템** (현재)
 > - [4편: Lane 스케줄링](react-architecture-04-lane-scheduling.md) (예정)
 
----
-
-*작성일: 2026-02-20*
-*분석 기반: React 18.3.1 (`react-dom.development.js` 직접 분석)*
+*분석 기반: React 18.3.1 (`packages/react-reconciler/src/ReactFiberHooks.js`)*
