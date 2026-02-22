@@ -1,1107 +1,154 @@
-# React 18 Suspense & Error Boundary 소스 코드 분석
+---
+title: "React는 왜 throw로 기다리는가 — Suspense와 ErrorBoundary의 설계 철학"
+date: "2025-02-20"
+tags: [React, Suspense, ErrorBoundary, 아키텍처, 파이버]
+series: "React 아키텍처 심층 분석"
+---
 
-> 분석 대상: `react-dom@18.3.1` — `react-dom.development.js` (29,923 lines)
-> 분석 날짜: 2026-02-20
+## 언어의 무기를 재발명하다
+
+소프트웨어 역사에서 가장 흥미로운 설계 결정들은 대부분 기존 도구를 전혀 다른 목적으로 전용(轉用)하는 데서 나온다. `throw`는 원래 예외 상황을 알리기 위한 언어 기능이다. 그런데 React 팀은 이것을 **비동기 제어 흐름의 신호**로 재정의했다.
+
+React 18의 Suspense와 ErrorBoundary는 표면적으로는 완전히 다른 문제를 해결하는 것처럼 보인다. 하나는 데이터가 아직 준비되지 않았을 때 로딩 상태를 보여주고, 다른 하나는 컴포넌트가 충돌했을 때 대체 UI를 보여준다. 그러나 내부 구현을 들여다보면 이 두 메커니즘은 완전히 동일한 파이프라인 위에서 동작한다. 컴포넌트가 Promise를 던지든 Error를 던지든, React의 렌더 루프는 같은 방식으로 반응한다.
+
+이 글은 React가 왜 이런 선택을 했는지, 그리고 그 선택이 어떤 철학적 일관성을 가지는지를 탐구한다.
 
 ---
 
-## 목차
+## 에러 경계의 역사: 조용한 죽음에서 명시적 실패로
 
-1. [전체 메커니즘 개요](#1-전체-메커니즘-개요)
-2. [SuspendedReason 상수 목록](#2-suspendedreason-상수-목록)
-3. [throwException 함수 전체 구조](#3-throwexception-함수-전체-구조)
-4. [handleError 함수와 workLoop try-catch](#4-handleerror-함수와-workloop-try-catch)
-5. [unwindWork / unwindInterruptedWork](#5-unwindwork--unwindinterruptedwork)
-6. [updateSuspenseComponent 처리 흐름](#6-updatesuspensecomponent-처리-흐름)
-7. [Ping & Retry 해소 흐름](#7-ping--retry-해소-흐름)
-8. [Error Boundary: createClassErrorUpdate](#8-error-boundary-createclasserrorupdate)
-9. [Fiber Flags 상수](#9-fiber-flags-상수)
-10. [전체 플로우 시퀀스 다이어그램](#10-전체-플로우-시퀀스-다이어그램)
+2017년 이전의 React 앱은 컴포넌트 내부에서 오류가 발생하면 조용히 무너졌다. 렌더 함수 안에서 예외가 발생하면 React는 이를 복구할 방법이 없었고, 앱 전체가 흰 화면으로 전환되거나 부분적으로 손상된 UI가 그대로 노출됐다. 사용자 입장에서는 왜 앱이 동작하지 않는지 알 수 없었고, 개발자 입장에서도 어떤 컴포넌트가 원인인지 추적하기 어려웠다.
+
+React 16이 도입한 ErrorBoundary는 이 문제에 대한 철학적 응답이었다. "에러는 발생할 수 있다. 그러나 에러가 전체 앱을 무너뜨려서는 안 된다." 이 원칙은 운영 환경에서 동작하는 소프트웨어의 현실을 반영한다. 하나의 위젯이 실패하더라도 나머지 앱은 정상적으로 동작해야 한다는 것이다.
+
+ErrorBoundary가 클래스 컴포넌트로만 구현 가능한 이유도 이 역사와 맞닿아 있다. React가 에러를 포착하고 대체 상태로 전환하려면 컴포넌트 인스턴스가 필요하고, 인스턴스 기반의 생명주기 메서드(`getDerivedStateFromError`, `componentDidCatch`)가 있어야 했다. 함수 컴포넌트로는 아직 이 역할을 수행할 수 없다. 이것은 기술적 한계가 아니라, 현재까지의 설계 우선순위 때문이다.
+
+Suspense는 다른 방향에서 등장했다. 데이터 페칭, 코드 스플리팅, 이미지 로딩 — 이 모든 비동기 작업들에 대해 React는 통일된 추상화를 원했다. "컴포넌트가 준비되지 않았을 때 React에게 알릴 수 있는 표준 방법은 무엇인가?" 그 답이 바로 Promise를 throw하는 것이었다.
 
 ---
 
-## 1. 전체 메커니즘 개요
+## throw 기반 제어 흐름의 본질
 
-React 18의 Suspense와 Error Boundary는 모두 **throw 기반의 예외 버블링**으로 동작한다. 컴포넌트가 Promise(Wakeable)나 Error를 throw하면, React의 렌더 루프가 이를 catch하여 파이버 트리를 거슬러 올라가며 적절한 바운더리를 찾는다.
+React의 렌더 루프를 이해하려면 먼저 그것이 거대한 `try-catch` 블록 안에 있다는 사실을 알아야 한다. `renderRootConcurrent` 함수는 `workLoopConcurrent`를 `try` 블록 안에서 실행하고, 무언가가 throw되면 `catch`에서 `handleError`를 호출한다. 중요한 점은 이 구조가 단순한 `try-catch`가 아니라 `do { try {...} catch {...} } while(true)` 패턴이라는 것이다.
 
-```
-컴포넌트 throw (Promise or Error)
-  └─ workLoopConcurrent/Sync catch
-       └─ handleError(root, thrownValue)
-            └─ throwException(root, returnFiber, sourceFiber, value, lanes)
-                 ├─ [Promise] getNearestSuspenseBoundaryToCapture()
-                 │    └─ ShouldCapture flag 설정
-                 │    └─ attachPingListener(root, wakeable, lanes)
-                 │    └─ attachRetryListener(suspenseBoundary, root, wakeable)
-                 └─ [Error] 조상 루프 → ClassComponent/HostRoot ShouldCapture
-            └─ completeUnitOfWork(erroredWork)
-                 └─ unwindWork() → ShouldCapture → DidCapture 전환
-                      └─ 해당 바운더리 fiber 반환 → beginWork 재시작
-                           └─ updateSuspenseComponent(): showFallback=true 분기
-```
+이 패턴의 의미는 심오하다. 에러가 발생해도 렌더 루프 자체는 종료되지 않는다. `handleError`가 적절한 처리를 완료하고 `workInProgress`를 올바른 위치로 재설정하면, 루프는 자동으로 재개된다. 즉, throw는 렌더를 중단시키는 것이 아니라 **렌더의 재개 지점을 변경하는 신호**다.
+
+이 설계를 항공기의 비상 착륙에 비유할 수 있다. 기체에 문제가 생겼다고 해서 비행 자체를 포기하지는 않는다. 대신 가장 가까운 안전한 공항으로 경로를 바꾼다. React에서 throw는 "지금 이 컴포넌트에서 렌더를 계속할 수 없다"는 신호이고, React는 가장 가까운 안전한 경계(Suspense 또는 ErrorBoundary)를 찾아 착륙한다.
 
 ---
 
-## 2. SuspendedReason 상수 목록
+## 파이버 트리를 거슬러 오르는 두 단계 신호
 
-React 18.3.1 소스에서 `workInProgressSuspendedReason`이라는 전역 변수 이름은 **React 19 실험 브랜치**에서 도입된 개념이다. React 18.3.1에서는 이에 해당하는 상태를 `workInProgressRootExitStatus` 로 관리한다.
+React가 예외를 처리하는 핵심 메커니즘은 **두 단계 플래그 시스템**이다. 이것을 이해하면 Suspense와 ErrorBoundary의 내부 동작이 명확해진다.
 
-**L25323–L25329**: `workInProgressRootExitStatus` 열거값
+컴포넌트가 무언가를 throw하면, React는 파이버 트리를 위쪽으로 순회하며 처리할 수 있는 경계를 찾는다. 경계를 찾았을 때 React는 즉시 "이 경계가 처리했다"고 표시하지 않는다. 대신 `ShouldCapture`라는 플래그를 설정한다. 이것은 "이 파이버가 캡처해야 한다는 의도"를 표현한다.
 
-```javascript
-// L25323
-var RootInProgress = 0;          // 렌더 진행 중
-var RootFatalErrored = 1;        // 복구 불가 에러 (조상 바운더리 없음)
-var RootErrored = 2;             // Error Boundary가 캡처한 에러
-var RootSuspended = 3;           // Suspense 발생 (fallback 커밋 가능)
-var RootSuspendedWithDelay = 4;  // Suspense + 지연 허용 (Transition 등)
-var RootCompleted = 5;           // 렌더 완료
-var RootDidNotComplete = 6;      // 렌더 미완료 (yield)
-```
+그 다음 단계에서 `unwindWork` 함수가 호출된다. 이 함수는 throw가 발생한 지점부터 경계 파이버까지의 스택을 되감으면서, `ShouldCapture` 플래그를 가진 파이버를 만나면 이를 `DidCapture`로 전환하고 해당 파이버를 반환한다. React는 이 파이버를 `workInProgress`로 설정하고 그 지점부터 렌더를 재시작한다.
 
-### 각 상태의 처리 방식
+왜 두 단계로 나누는가? `unwindWork`는 단순히 플래그를 바꾸는 일만 하지 않는다. Context 스택, Suspense Context 스택, Host Container 스택 등 렌더 과정에서 쌓인 모든 상태를 정리한다. ShouldCapture를 발견하기 전까지 지나온 모든 파이버의 스택을 올바르게 팝해야 한다. 이 정리 작업 없이 바로 경계 파이버로 점프하면 스택 상태가 오염된다. 두 단계 구조는 이 정리 작업의 필요성에서 나온 설계다.
 
-| 상태 | 트리거 함수 | 의미 |
-|------|-----------|------|
-| `RootInProgress` | 초기값 | 아직 아무것도 throw하지 않음 |
-| `RootSuspended` | `renderDidSuspend()` (L26398) | Suspense 바운더리가 캡처 완료. fallback 렌더 예약 |
-| `RootSuspendedWithDelay` | `renderDidSuspendDelayIfPossible()` (L26401–L26416) | Transition/delay 가능. 더 오래 기다려 UX 개선 |
-| `RootErrored` | `renderDidError()` (L26422–L26430) | Error Boundary가 캡처. 재렌더 예약 |
-| `RootFatalErrored` | `handleError` 내부 (L26318) | 루트까지 전파된 에러. 앱 크래시 |
-
-**L26395–L26416**: `renderDidSuspend` vs `renderDidSuspendDelayIfPossible`
-
-```javascript
-// L26395
-function renderDidSuspend() {
-  if (workInProgressRootExitStatus === RootInProgress) {
-    workInProgressRootExitStatus = RootSuspended;
-  }
-}
-
-// L26401
-function renderDidSuspendDelayIfPossible() {
-  if (
-    workInProgressRootExitStatus === RootInProgress ||
-    workInProgressRootExitStatus === RootSuspended ||
-    workInProgressRootExitStatus === RootErrored
-  ) {
-    workInProgressRootExitStatus = RootSuspendedWithDelay;
-  }
-  // 스킵된 lanes가 있으면 root를 suspended로 마킹해 즉시 재시작 유도
-  if (workInProgressRoot !== null && (
-    includesNonIdleWork(workInProgressRootSkippedLanes) ||
-    includesNonIdleWork(workInProgressRootInterleavedUpdatedLanes)
-  )) {
-    markRootSuspended$1(workInProgressRoot, workInProgressRootRenderLanes);
-  }
-}
-```
+최종적으로 `updateSuspenseComponent`가 호출될 때, 이 함수는 `DidCapture` 플래그를 확인하여 fallback을 렌더할지 primary 콘텐츠를 렌더할지 결정한다. 그리고 이 플래그를 소비(`&= ~DidCapture`)한다. 플래그는 한 번 읽히고 사라진다.
 
 ---
 
-## 3. throwException 함수 전체 구조
+## Promise와 Error: 같은 입구, 다른 목적지
 
-**L19017–L19148**: `throwException` — Suspense와 Error Boundary의 핵심 진입점
+`throwException` 함수는 두 종류의 throw를 처리한다. value가 `.then` 메서드를 가진 객체(Wakeable)이면 Suspense 경로로, 그렇지 않으면 Error Boundary 경로로 분기한다.
 
-```javascript
-// L19017
-function throwException(root, returnFiber, sourceFiber, value, rootRenderLanes) {
-  // 1단계: sourceFiber를 Incomplete로 마킹
-  sourceFiber.flags |= Incomplete;
-```
+Suspense 경로에서 React가 하는 일은 두 가지다. 첫 번째는 가장 가까운 `SuspenseComponent` 파이버를 찾아 `ShouldCapture` 플래그를 설정하는 것이고, 두 번째는 Promise가 resolve됐을 때 재렌더를 트리거할 리스너를 등록하는 것이다.
 
-### 3.1 Thenable(Promise) vs Error 분기
+흥미로운 것은 이 리스너가 두 종류라는 점이다. **Ping Listener**는 렌더 단계에서 등록된다. Promise가 resolve되면 `pingSuspendedRoot`가 호출되어 루트 전체를 재스케줄링한다. 이것은 "Promise가 해소됐으니 이 우선순위 레인을 다시 시작하라"는 신호다. **Retry Listener**는 커밋 단계에서 등록된다. fallback UI가 실제로 DOM에 그려진 이후, `attachSuspenseRetryListeners`가 Promise에 retry 함수를 바인딩한다. Promise가 resolve되면 `resolveRetryWakeable`이 호출되어 해당 Suspense 경계만 재렌더를 요청한다.
 
-```javascript
-  // L19028: value가 Promise(Wakeable)인지 판별
-  if (value !== null && typeof value === 'object' && typeof value.then === 'function') {
-    // ---- Suspense 경로 ----
-    var wakeable = value;
+두 리스너가 동시에 존재하는 이유는 타이밍의 문제다. Ping Listener는 렌더가 진행되는 동안 Promise가 resolve됐을 때 빠르게 반응하기 위한 것이고, Retry Listener는 fallback이 커밋된 이후의 정상적인 재시도 경로다. 중복 재렌더를 방지하기 위해 각 리스너는 자신의 캐시에서 wakeable을 삭제한 후 동작한다.
 
-    // Legacy Mode 훅 컴포넌트를 위한 상태 리셋
-    resetSuspendedComponent(sourceFiber);
-
-    // 가장 가까운 SuspenseBoundary 탐색
-    var suspenseBoundary = getNearestSuspenseBoundaryToCapture(returnFiber);
-
-    if (suspenseBoundary !== null) {
-      suspenseBoundary.flags &= ~ForceClientRender;
-
-      // ShouldCapture 플래그 설정 (unwindWork에서 DidCapture로 전환됨)
-      markSuspenseBoundaryShouldCapture(
-        suspenseBoundary, returnFiber, sourceFiber, root, rootRenderLanes
-      );
-
-      // Concurrent Mode에서만 Ping 리스너 등록
-      if (suspenseBoundary.mode & ConcurrentMode) {
-        attachPingListener(root, wakeable, rootRenderLanes);
-      }
-
-      // Retry 리스너 등록 (fallback 커밋 후 재시도)
-      attachRetryListener(suspenseBoundary, root, wakeable);
-      return;
-    } else {
-      // SuspenseBoundary 없음
-      if (!includesSyncLane(rootRenderLanes)) {
-        // Async 렌더: ping 후 루트부터 재시작
-        attachPingListener(root, wakeable, rootRenderLanes);
-        renderDidSuspendDelayIfPossible();
-        return;
-      }
-      // Sync 렌더: Error로 변환하여 Error Boundary로 전달
-      value = new Error(
-        'A component suspended while responding to synchronous input...'
-      );
-    }
-  } else {
-    // ---- Error Boundary 경로 (일반 에러) ----
-    if (getIsHydrating() && sourceFiber.mode & ConcurrentMode) {
-      // Hydration 에러: SuspenseBoundary로 클라이언트 렌더 전환
-      var _suspenseBoundary = getNearestSuspenseBoundaryToCapture(returnFiber);
-      if (_suspenseBoundary !== null) {
-        _suspenseBoundary.flags |= ForceClientRender;
-        markSuspenseBoundaryShouldCapture(...);
-        queueHydrationError(createCapturedValueAtFiber(value, sourceFiber));
-        return;
-      }
-    }
-  }
-```
-
-### 3.2 SuspenseComponent 탐색 루프
-
-**L18891–L18905**: `getNearestSuspenseBoundaryToCapture`
-
-```javascript
-// L18891
-function getNearestSuspenseBoundaryToCapture(returnFiber) {
-  var node = returnFiber;
-  do {
-    // tag === SuspenseComponent(13)이고 캡처 가능한 경계 탐색
-    if (node.tag === SuspenseComponent && shouldCaptureSuspense(node)) {
-      return node;
-    }
-    // 이미 이번 렌더에서 캡처한 경계는 건너뜀
-    node = node.return;
-  } while (node !== null);
-  return null;
-}
-```
-
-**L15175–L15198**: `shouldCaptureSuspense` — 캡처 가능 여부 판단
-
-```javascript
-// L15175
-function shouldCaptureSuspense(workInProgress, hasInvisibleParent) {
-  var nextState = workInProgress.memoizedState;
-
-  if (nextState !== null) {
-    if (nextState.dehydrated !== null) {
-      // Dehydrated 경계는 항상 캡처
-      return true;
-    }
-    // 이미 fallback 표시 중이면 캡처하지 않음 (상위로 버블)
-    return false;
-  }
-
-  // DEV 빌드에서 일반 경계는 항상 캡처
-  // Production에서는 invisible parent 여부 등 추가 로직
-  {
-    return true;
-  }
-}
-```
-
-### 3.3 attachPingListener: RetryQueue 구조
-
-**L18805–L18848**: `attachPingListener`
-
-```javascript
-// L18805
-function attachPingListener(root, wakeable, lanes) {
-  // root.pingCache: WeakMap<wakeable, Set<lanes>>
-  var pingCache = root.pingCache;
-  var threadIDs;
-
-  if (pingCache === null) {
-    pingCache = root.pingCache = new PossiblyWeakMap$1();
-    threadIDs = new Set();
-    pingCache.set(wakeable, threadIDs);
-  } else {
-    threadIDs = pingCache.get(wakeable);
-    if (threadIDs === undefined) {
-      threadIDs = new Set();
-      pingCache.set(wakeable, threadIDs);
-    }
-  }
-
-  if (!threadIDs.has(lanes)) {
-    // lanes를 "thread ID"로 사용해 중복 리스너 방지
-    threadIDs.add(lanes);
-    var ping = pingSuspendedRoot.bind(null, root, wakeable, lanes);
-    wakeable.then(ping, ping); // resolve/reject 모두 동일 핸들러
-  }
-}
-```
-
-**L18850–L18870**: `attachRetryListener` — `fiber.updateQueue`가 RetryQueue
-
-```javascript
-// L18850
-function attachRetryListener(suspenseBoundary, root, wakeable, lanes) {
-  // suspenseBoundary.updateQueue = Set<Wakeable> (RetryQueue)
-  var wakeables = suspenseBoundary.updateQueue;
-
-  if (wakeables === null) {
-    var updateQueue = new Set();
-    updateQueue.add(wakeable);
-    suspenseBoundary.updateQueue = updateQueue;
-  } else {
-    wakeables.add(wakeable);
-  }
-}
-```
-
-> `updateQueue`는 일반 ClassComponent에서 업데이트 링크드 리스트로 쓰이지만, SuspenseComponent에서는 **`Set<Wakeable>`** 로 재사용된다.
-
-### 3.4 Error Boundary 탐색 루프 (throwException 하단)
-
-**L19103–L19148**:
-
-```javascript
-  // value를 CapturedValue로 래핑
-  value = createCapturedValueAtFiber(value, sourceFiber);
-  renderDidError(value);
-
-  // 부모 트리를 순회하며 캡처 가능한 바운더리 탐색
-  var workInProgress = returnFiber;
-  do {
-    switch (workInProgress.tag) {
-      case HostRoot: {
-        // 루트까지 올라온 에러: CaptureUpdate 예약
-        workInProgress.flags |= ShouldCapture;
-        var lane = pickArbitraryLane(rootRenderLanes);
-        workInProgress.lanes = mergeLanes(workInProgress.lanes, lane);
-        var update = createRootErrorUpdate(workInProgress, errorInfo, lane);
-        enqueueCapturedUpdate(workInProgress, update);
-        return;
-      }
-      case ClassComponent: {
-        var ctor = workInProgress.type;
-        var instance = workInProgress.stateNode;
-        // getDerivedStateFromError 또는 componentDidCatch 구현 여부 확인
-        if (
-          (workInProgress.flags & DidCapture) === NoFlags &&
-          (typeof ctor.getDerivedStateFromError === 'function' ||
-            (instance !== null &&
-              typeof instance.componentDidCatch === 'function' &&
-              !isAlreadyFailedLegacyErrorBoundary(instance)))
-        ) {
-          workInProgress.flags |= ShouldCapture;
-          var _lane = pickArbitraryLane(rootRenderLanes);
-          workInProgress.lanes = mergeLanes(workInProgress.lanes, _lane);
-          // CaptureUpdate 생성 및 큐에 추가
-          var _update = createClassErrorUpdate(workInProgress, errorInfo, _lane);
-          enqueueCapturedUpdate(workInProgress, _update);
-          return;
-        }
-        break;
-      }
-    }
-    workInProgress = workInProgress.return;
-  } while (workInProgress !== null);
-```
+Error Boundary 경로는 더 단순하다. 파이버 트리를 위쪽으로 순회하면서 `getDerivedStateFromError`나 `componentDidCatch`를 구현한 ClassComponent, 또는 HostRoot를 찾는다. 찾으면 `ShouldCapture` 플래그를 설정하고 `CaptureUpdate`를 해당 파이버의 업데이트 큐에 넣는다. 이 업데이트는 이후 `processUpdateQueue`에서 처리되어 에러 상태로의 전환을 일으킨다.
 
 ---
 
-## 4. handleError 함수와 workLoop try-catch
+## OffscreenComponent: 사라지지 않는 Primary 트리
 
-### 4.1 renderRootConcurrent의 try-catch 구조
+React Suspense의 가장 중요한 설계 결정 중 하나는 fallback을 표시할 때 primary 콘텐츠를 버리지 않는다는 것이다.
 
-**L26509–L26555**: `renderRootConcurrent`
+fallback이 표시될 때, React는 primary 자식들을 `OffscreenComponent`(내부 tag=22)로 감싸서 `mode='hidden'` 상태로 유지한다. DOM에서는 보이지 않지만 파이버 트리에는 살아있다. 이 파이버의 `memoizedState`에는 `baseLanes`, `cachePool`, `transitions` 등의 정보가 담긴다. Promise가 resolve되면 React는 새로운 primary 트리를 처음부터 만들 필요 없이, 기존 OffscreenFiber를 `mode='visible'`로 전환하고 재렌더만 수행한다.
 
-```javascript
-// L26509
-function renderRootConcurrent(root, lanes) {
-  // ...준비 작업...
+이것은 단순한 최적화가 아니다. Transitions와 함께 생각하면 의미가 더 깊어진다. 사용자가 페이지를 전환할 때 React는 현재 화면을 유지하면서 배경에서 새 화면을 준비할 수 있다. 이것이 가능한 이유는 두 상태의 파이버 트리가 동시에 메모리에 존재할 수 있기 때문이다.
 
-  do {
-    try {
-      workLoopConcurrent(); // while (workInProgress !== null && !shouldYield())
-      break;
-    } catch (thrownValue) {
-      handleError(root, thrownValue); // 에러/Promise 처리
-    }
-  } while (true); // 에러 처리 후 workLoop 재개
-
-  // ...
-}
-```
-
-**중요**: `do { try { workLoop } catch { handleError } } while(true)` 패턴은 에러 처리 후 자동으로 `workLoopConcurrent`를 **재개**한다. `handleError` 내부에서 `workInProgress`를 적절히 설정하면 렌더를 이어서 진행할 수 있다.
-
-### 4.2 handleError 상세 흐름
-
-**L26302–L26370**: `handleError`
-
-```javascript
-// L26302
-function handleError(root, thrownValue) {
-  do {
-    var erroredWork = workInProgress;
-
-    try {
-      // 렌더 중 모듈 상태 리셋
-      resetContextDependencies();
-      resetHooksAfterThrow();
-      resetCurrentFiber();
-      ReactCurrentOwner$2.current = null;
-
-      if (erroredWork === null || erroredWork.return === null) {
-        // 루트 fiber에서 에러: 복구 불가
-        workInProgressRootExitStatus = RootFatalErrored;
-        workInProgressRootFatalError = thrownValue;
-        workInProgress = null;
-        return;
-      }
-
-      // Profiler 타이머 처리 (DEV)
-      if (enableProfilerTimer && erroredWork.mode & ProfileMode) {
-        stopProfilerTimerIfRunningAndRecordDelta(erroredWork, true);
-      }
-
-      // DevTools/Scheduling Profiler 통보
-      if (enableSchedulingProfiler) {
-        markComponentRenderStopped();
-        if (typeof thrownValue?.then === 'function') {
-          markComponentSuspended(erroredWork, thrownValue, workInProgressRootRenderLanes);
-        } else {
-          markComponentErrored(erroredWork, thrownValue, workInProgressRootRenderLanes);
-        }
-      }
-
-      // 핵심 호출: throwException이 ShouldCapture 플래그 설정
-      throwException(
-        root,
-        erroredWork.return,  // returnFiber
-        erroredWork,         // sourceFiber
-        thrownValue,
-        workInProgressRootRenderLanes
-      );
-
-      // completeUnitOfWork → unwindWork 호출로 스택 되감기
-      completeUnitOfWork(erroredWork);
-
-    } catch (yetAnotherThrownValue) {
-      // 에러 처리 경로 자체에서 에러 발생 시
-      thrownValue = yetAnotherThrownValue;
-      if (workInProgress === erroredWork && erroredWork !== null) {
-        // 같은 fiber에서 재발: 부모로 올라감
-        erroredWork = erroredWork.return;
-        workInProgress = erroredWork;
-      } else {
-        erroredWork = workInProgress;
-      }
-      continue;
-    }
-
-    return; // 정상 처리 완료: workLoopConcurrent 재개
-  } while (true);
-}
-```
-
-### 4.3 handleError → throwException → completeUnitOfWork 연쇄
-
-```
-handleError(root, thrownValue)
-  │
-  ├─ throwException(root, erroredWork.return, erroredWork, thrownValue, lanes)
-  │   ├─ [Promise] SuspenseBoundary.flags |= ShouldCapture
-  │   │           attachPingListener()
-  │   │           attachRetryListener()
-  │   └─ [Error]  ClassComponent/HostRoot.flags |= ShouldCapture
-  │               enqueueCapturedUpdate()
-  │
-  └─ completeUnitOfWork(erroredWork)
-      └─ completeWork() 순회 중 ShouldCapture 있는 fiber에서
-         └─ unwindWork() 호출
-              └─ ShouldCapture → DidCapture 전환 + fiber 반환
-                   └─ workInProgress = fiber (해당 바운더리로 재시작)
-```
+SuspenseComponent의 `memoizedState`는 `SUSPENDED_MARKER`라는 고정된 객체다. 이 객체가 있으면 현재 fallback을 표시 중이고, `null`이면 primary를 표시 중이다. Promise가 resolve되어 primary로 전환될 때, React는 이 `memoizedState`를 `null`로 설정하고 OffscreenFiber를 `mode='visible'`로 바꾸면서 `SUSPENDED_MARKER`를 제거한다.
 
 ---
 
-## 5. unwindWork / unwindInterruptedWork
+## Error Boundary가 ClassComponent인 이유
 
-### 5.1 unwindWork — ShouldCapture → DidCapture 전환
+Error Boundary가 클래스 컴포넌트만 될 수 있다는 제약은 종종 불편함으로 여겨지지만, 이는 필요에서 나온 설계다.
 
-**L22680–L22795**: `unwindWork`
+`createClassErrorUpdate`가 생성하는 `CaptureUpdate`의 payload는 함수다. 이 함수가 `processUpdateQueue`에서 호출될 때 `getDerivedStateFromError(error)`의 반환값을 새 상태로 사용한다. 이것은 에러를 상태 전환의 입력으로 사용하는 패턴이다.
 
-```javascript
-// L22680
-function unwindWork(current, workInProgress, renderLanes) {
-  popTreeContext(workInProgress);
+`componentDidCatch`는 커밋 단계에서 호출된다. 이 메서드는 컴포넌트 인스턴스(`this`)를 통해 호출되어야 하므로, 인스턴스를 가진 클래스 컴포넌트가 필요하다. 함수 컴포넌트는 렌더마다 새로운 실행 컨텍스트를 가지므로 "이전 에러 상태"를 보유하기 어렵다.
 
-  switch (workInProgress.tag) {
+루트까지 전파된 에러는 다르게 처리된다. `createRootErrorUpdate`는 `{ element: null }`을 payload로 가지는 업데이트를 생성한다. 즉, 아무것도 잡지 못한 에러는 앱 전체를 언마운트한다. 개발 환경에서 친숙한 "A component suspended while responding to synchronous input..." 같은 에러 메시지는 이 경로에서 출력된다.
 
-    case ClassComponent: {
-      var Component = workInProgress.type;
-      if (isContextProvider(Component)) {
-        popContext(workInProgress); // Context 스택 팝
-      }
-      var flags = workInProgress.flags;
-      if (flags & ShouldCapture) {
-        // ShouldCapture → DidCapture 전환 (Error Boundary 활성화)
-        workInProgress.flags = flags & ~ShouldCapture | DidCapture;
-        if ((workInProgress.mode & ProfileMode) !== NoMode) {
-          transferActualDuration(workInProgress);
-        }
-        return workInProgress; // 이 fiber로 렌더 재시작
-      }
-      return null;
-    }
-
-    case HostRoot: {
-      var root = workInProgress.stateNode;
-      popHostContainer(workInProgress);   // Host 컨테이너 스택 팝
-      popTopLevelContextObject(workInProgress);
-      resetWorkInProgressVersions();
-      var _flags = workInProgress.flags;
-      if ((_flags & ShouldCapture) !== NoFlags && (_flags & DidCapture) === NoFlags) {
-        // 루트에서 에러: DidCapture로 전환
-        workInProgress.flags = _flags & ~ShouldCapture | DidCapture;
-        return workInProgress;
-      }
-      return null;
-    }
-
-    case HostComponent: {
-      popHostContext(workInProgress);
-      return null; // HostComponent는 에러 캡처 안 함
-    }
-
-    case SuspenseComponent: {
-      popSuspenseContext(workInProgress); // Suspense Context 스택 팝
-      var suspenseState = workInProgress.memoizedState;
-      if (suspenseState !== null && suspenseState.dehydrated !== null) {
-        if (workInProgress.alternate === null) {
-          throw new Error('Threw in newly mounted dehydrated component...');
-        }
-        resetHydrationState();
-      }
-      var _flags2 = workInProgress.flags;
-      if (_flags2 & ShouldCapture) {
-        // ShouldCapture → DidCapture: fallback 렌더 신호
-        workInProgress.flags = _flags2 & ~ShouldCapture | DidCapture;
-        if ((workInProgress.mode & ProfileMode) !== NoMode) {
-          transferActualDuration(workInProgress);
-        }
-        return workInProgress; // SuspenseComponent fiber 반환 → beginWork 재시작
-      }
-      return null;
-    }
-
-    case SuspenseListComponent: {
-      popSuspenseContext(workInProgress);
-      // SuspenseList는 직접 캡처하지 않고 내부 바운더리에 위임
-      return null;
-    }
-
-    case HostPortal:
-      popHostContainer(workInProgress);
-      return null;
-
-    case ContextProvider:
-      var context = workInProgress.type._context;
-      popProvider(context, workInProgress);
-      return null;
-
-    case OffscreenComponent:
-    case LegacyHiddenComponent:
-      popRenderLanes(workInProgress);
-      return null;
-
-    default:
-      return null;
-  }
-}
-```
-
-### 5.2 unwindInterruptedWork — 중단된 작업 정리
-
-**L22796–L22860**: `unwindInterruptedWork`
-
-중단된 렌더를 버릴 때 스택만 정리하고 ShouldCapture 전환은 하지 않는다.
-
-```javascript
-// L22796
-function unwindInterruptedWork(current, interruptedWork, renderLanes) {
-  popTreeContext(interruptedWork);
-
-  switch (interruptedWork.tag) {
-    case ClassComponent: {
-      var childContextTypes = interruptedWork.type.childContextTypes;
-      if (childContextTypes !== null && childContextTypes !== undefined) {
-        popContext(interruptedWork); // 컨텍스트 스택만 팝
-      }
-      break;
-    }
-    case HostRoot: {
-      popHostContainer(interruptedWork);
-      popTopLevelContextObject(interruptedWork);
-      resetWorkInProgressVersions();
-      break;
-    }
-    case HostComponent:
-      popHostContext(interruptedWork);
-      break;
-    case HostPortal:
-      popHostContainer(interruptedWork);
-      break;
-    case SuspenseComponent:
-      popSuspenseContext(interruptedWork); // Suspense 컨텍스트 스택만 팝
-      break;
-    case SuspenseListComponent:
-      popSuspenseContext(interruptedWork);
-      break;
-    case ContextProvider:
-      var context = interruptedWork.type._context;
-      popProvider(context, interruptedWork);
-      break;
-    case OffscreenComponent:
-    case LegacyHiddenComponent:
-      popRenderLanes(interruptedWork);
-      break;
-    // default: 아무것도 안 함
-  }
-}
-```
-
-**unwindWork vs unwindInterruptedWork 비교**
-
-| 항목 | `unwindWork` | `unwindInterruptedWork` |
-|------|-------------|------------------------|
-| 목적 | 에러/Suspense 캡처 후 스택 되감기 | 렌더 중단 시 스택 정리 |
-| ShouldCapture 처리 | `ShouldCapture → DidCapture` 전환 | 없음 |
-| 반환값 | 캡처 fiber 또는 null | void |
-| 호출 시점 | `completeUnitOfWork` 내 에러 경로 | `prepareFreshStack` 등 |
+한 가지 주목할 만한 세부 사항이 있다. `isAlreadyFailedLegacyErrorBoundary` 체크다. 동일한 ErrorBoundary가 이미 한 번 실패했다면, 같은 경계가 같은 에러를 다시 포착하지 않는다. 이것은 에러 루프를 방지하기 위한 보호 장치다. ErrorBoundary의 `render` 메서드 자체가 throw하면 그 에러는 부모 ErrorBoundary로 전파된다.
 
 ---
 
-## 6. updateSuspenseComponent 처리 흐름
+## 렌더 종료 상태: 6가지 결말
 
-**L20308–L20428**: `updateSuspenseComponent`
+React의 렌더 루프는 여섯 가지 방식으로 끝날 수 있다. 이 상태들을 이해하면 Suspense와 ErrorBoundary가 전체 스케줄링 시스템과 어떻게 통합되는지 보인다.
 
-### 6.1 DidCapture 플래그 확인
+가장 단순한 결말은 `RootCompleted`다. 모든 작업이 정상적으로 완료된 상태다. `RootSuspended`는 Suspense 경계가 포착에 성공했을 때다. fallback을 커밋할 준비가 된 상태다. `RootSuspendedWithDelay`는 Transition과 같은 지연 허용 시나리오에서 발생한다. React는 더 오래 기다려서 불필요한 로딩 상태 전환을 줄이려 한다.
 
-```javascript
-// L20308
-function updateSuspenseComponent(current, workInProgress, renderLanes) {
-  var nextProps = workInProgress.pendingProps;
+`RootErrored`는 Error Boundary가 포착에 성공했을 때다. 에러 UI로 재렌더가 예약된다. `RootFatalErrored`는 루트까지 에러가 전파됐을 때, 즉 ErrorBoundary가 하나도 없거나 모두 실패한 경우다. `RootDidNotComplete`는 렌더가 중단됐을 때(yield)로, 우선순위가 더 높은 작업이 있어서 나중에 재시도한다.
 
-  // DEV: DevTools가 강제로 fallback 표시 요청 시
-  {
-    if (shouldSuspend(workInProgress)) {
-      workInProgress.flags |= DidCapture;
-    }
-  }
-
-  var suspenseContext = suspenseStackCursor.current;
-  var showFallback = false;
-
-  // unwindWork에서 ShouldCapture → DidCapture로 전환된 플래그 확인
-  var didSuspend = (workInProgress.flags & DidCapture) !== NoFlags;
-
-  if (didSuspend || shouldRemainOnFallback(suspenseContext, current)) {
-    // 자식 트리에서 Suspend 발생: fallback 렌더링
-    showFallback = true;
-    workInProgress.flags &= ~DidCapture; // 플래그 소비
-  } else {
-    // Primary 렌더 시도
-    if (current === null || current.memoizedState !== null) {
-      // 신규 마운트 또는 이미 fallback 표시 중
-      suspenseContext = addSubtreeSuspenseContext(
-        suspenseContext,
-        InvisibleParentSuspenseContext // 자식에게 "보이지 않는 부모" 신호
-      );
-    }
-  }
-
-  suspenseContext = setDefaultShallowSuspenseContext(suspenseContext);
-  pushSuspenseContext(workInProgress, suspenseContext);
-```
-
-### 6.2 showFallback vs showPrimary 분기
-
-```javascript
-  if (current === null) {
-    // ---- 초기 마운트 ----
-    tryToClaimNextHydratableInstance(workInProgress); // SSR 지원
-
-    if (showFallback) {
-      // Fallback 렌더: OffscreenFiber(hidden) + FallbackFiber
-      var fallbackFragment = mountSuspenseFallbackChildren(
-        workInProgress, nextProps.children, nextProps.fallback, renderLanes
-      );
-      var primaryChildFragment = workInProgress.child; // OffscreenFiber
-      primaryChildFragment.memoizedState = mountSuspenseOffscreenState(renderLanes);
-      workInProgress.memoizedState = SUSPENDED_MARKER; // Suspense 상태 마킹
-      return fallbackFragment; // FallbackFiber 반환
-    } else {
-      // Primary 렌더: OffscreenFiber(visible)만 생성
-      return mountSuspensePrimaryChildren(workInProgress, nextProps.children);
-    }
-
-  } else {
-    // ---- 업데이트 ----
-    var prevState = current.memoizedState; // null이면 primary, 있으면 fallback
-
-    if (showFallback) {
-      // Primary → Fallback 전환 또는 Fallback 유지
-      var fallbackChildFragment = updateSuspenseFallbackChildren(
-        current, workInProgress,
-        nextProps.children,   // primary (hidden으로 유지)
-        nextProps.fallback,   // fallback (표시)
-        renderLanes
-      );
-      var _primaryChildFragment2 = workInProgress.child;
-
-      // OffscreenFiber의 memoizedState: baseLanes 추적
-      _primaryChildFragment2.memoizedState =
-        prevOffscreenState === null
-          ? mountSuspenseOffscreenState(renderLanes)
-          : updateSuspenseOffscreenState(prevOffscreenState, renderLanes);
-
-      _primaryChildFragment2.childLanes = getRemainingWorkInPrimaryTree(current, renderLanes);
-      workInProgress.memoizedState = SUSPENDED_MARKER;
-      return fallbackChildFragment;
-    } else {
-      // Fallback → Primary 전환 (Promise resolved)
-      var _primaryChildFragment3 = updateSuspensePrimaryChildren(
-        current, workInProgress, nextProps.children, renderLanes
-      );
-      workInProgress.memoizedState = null; // SUSPENDED_MARKER 제거
-      return _primaryChildFragment3;
-    }
-  }
-}
-```
-
-### 6.3 OffscreenFiber와 FallbackFiber의 구조
-
-**SuspenseComponent의 Fiber 트리 구조**:
-
-```
-SuspenseComponent (fiber)
-  └─ child: OffscreenComponent (primaryChildFragment)
-       │  mode: 'hidden' (fallback 표시 중) | 'visible' (primary 표시 중)
-       │  memoizedState: { baseLanes, cachePool, transitions }
-       └─ sibling: Fragment (fallbackChildFragment) ← fallback UI
-```
-
-**L20258–L20281**: SUSPENDED_MARKER와 OffscreenState
-
-```javascript
-// L20258: SuspenseComponent.memoizedState 값
-var SUSPENDED_MARKER = {
-  dehydrated: null,
-  treeContext: null,
-  retryLane: NoLane  // 재시도 Lane
-};
-
-// L20264: OffscreenFiber.memoizedState 값
-function mountSuspenseOffscreenState(renderLanes) {
-  return {
-    baseLanes: renderLanes,   // 숨겨진 트리가 렌더해야 할 기본 lanes
-    cachePool: getSuspendedCache(),
-    transitions: null
-  };
-}
-```
-
-**completeWork에서 DidCapture 재처리** (L22315–L22325):
-
-```javascript
-// L22315 (completeWork, SuspenseComponent case)
-if ((workInProgress.flags & DidCapture) !== NoFlags) {
-  // Suspend 발생: fallback으로 재렌더 신호
-  workInProgress.lanes = renderLanes;
-  // bubbleProperties 호출 없이 즉시 반환
-  // → beginWork에서 updateSuspenseComponent 다시 호출됨
-  return workInProgress;
-}
-```
+이 여섯 상태의 중요성은 `pingSuspendedRoot`에서 잘 드러난다. Promise가 resolve될 때 React는 현재 렌더 상태를 확인한다. `RootSuspendedWithDelay` 상태였다면 즉시 `prepareFreshStack`을 호출해 루트부터 재시작한다. 단순한 `RootSuspended`라면 `workInProgressRootPingedLanes`에 기록하여 나중에 처리한다. 같은 Promise resolve 이벤트도 렌더 상태에 따라 다르게 반응하는 것이다.
 
 ---
 
-## 7. Ping & Retry 해소 흐름
+## Concurrent Mode와 Legacy Mode의 차이
 
-### 7.1 Promise 해소 시: pingSuspendedRoot
+Concurrent Mode는 React 18의 핵심 기능이지만, Suspense 처리에서 Legacy Mode와의 차이는 미묘하면서도 중요하다.
 
-**L27217–L27250**: `pingSuspendedRoot`
+Ping Listener는 Concurrent Mode에서만 등록된다. Legacy Mode에서는 동기적으로 즉시 커밋하기 때문에, 렌더 도중 Promise resolve를 기다릴 필요가 없다. 렌더가 시작되고 fallback이 결정되면 바로 커밋한다.
 
-```javascript
-// L27217
-function pingSuspendedRoot(root, wakeable, pingedLanes) {
-  var pingCache = root.pingCache;
-  if (pingCache !== null) {
-    // 해소된 wakeable의 캐시 엔트리 삭제
-    pingCache.delete(wakeable);
-  }
+`ShouldCapture` 플래그 처리도 다르다. Concurrent Mode에서는 `throwException`이 `ShouldCapture`를 설정하고 `unwindWork`에서 `DidCapture`로 전환한다. Legacy Mode에서는 일부 경로에서 `ShouldCapture` 없이 직접 `DidCapture`를 설정한다. 이것은 Legacy Mode가 단계적 처리보다 즉각적인 반응을 선호하기 때문이다.
 
-  var eventTime = requestEventTime();
-  markRootPinged(root, pingedLanes);
-
-  if (
-    workInProgressRoot === root &&
-    isSubsetOfLanes(workInProgressRootRenderLanes, pingedLanes)
-  ) {
-    // 현재 렌더 중인 root와 동일한 우선순위에서 ping 수신
-    if (
-      workInProgressRootExitStatus === RootSuspendedWithDelay ||
-      (workInProgressRootExitStatus === RootSuspended &&
-        includesOnlyRetries(workInProgressRootRenderLanes) &&
-        now() - globalMostRecentFallbackTime < FALLBACK_THROTTLE_MS)
-    ) {
-      // 지금 바로 루트부터 재시작
-      prepareFreshStack(root, NoLanes);
-    } else {
-      // 나중에 재시작할 수 있도록 pingedLanes 기록
-      workInProgressRootPingedLanes = mergeLanes(
-        workInProgressRootPingedLanes,
-        pingedLanes
-      );
-    }
-  }
-
-  ensureRootIsScheduled(root, eventTime);
-}
-```
-
-### 7.2 Fallback 커밋 후: resolveRetryWakeable
-
-**L27282–L27312**: `resolveRetryWakeable`
-
-```javascript
-// L27282
-function resolveRetryWakeable(boundaryFiber, wakeable) {
-  var retryLane = NoLane;
-  var retryCache;
-
-  switch (boundaryFiber.tag) {
-    case SuspenseComponent:
-      retryCache = boundaryFiber.stateNode; // WeakSet<Wakeable>
-      var suspenseState = boundaryFiber.memoizedState;
-      if (suspenseState !== null) {
-        retryLane = suspenseState.retryLane; // 이전에 배정된 retry lane
-      }
-      break;
-    case SuspenseListComponent:
-      retryCache = boundaryFiber.stateNode;
-      break;
-  }
-
-  if (retryCache !== null) {
-    retryCache.delete(wakeable); // 중복 retry 방지
-  }
-
-  retryTimedOutBoundary(boundaryFiber, retryLane);
-}
-
-// L27251
-function retryTimedOutBoundary(boundaryFiber, retryLane) {
-  if (retryLane === NoLane) {
-    retryLane = requestRetryLane(boundaryFiber);
-  }
-  var eventTime = requestEventTime();
-  var root = enqueueConcurrentRenderForLane(boundaryFiber, retryLane);
-  if (root !== null) {
-    markRootUpdated(root, retryLane, eventTime);
-    ensureRootIsScheduled(root, eventTime);
-  }
-}
-```
-
-### 7.3 Commit Phase: attachSuspenseRetryListeners
-
-**L24240–L24277**: fallback 커밋 시 retry 리스너 등록
-
-```javascript
-// L24240
-function attachSuspenseRetryListeners(finishedWork) {
-  // finishedWork.updateQueue = Set<Wakeable> (attachRetryListener에서 채워진 것)
-  var wakeables = finishedWork.updateQueue;
-
-  if (wakeables !== null) {
-    finishedWork.updateQueue = null;
-    var retryCache = finishedWork.stateNode; // WeakSet 형태의 캐시
-
-    if (retryCache === null) {
-      retryCache = finishedWork.stateNode = new PossiblyWeakSet();
-    }
-
-    wakeables.forEach(function (wakeable) {
-      // resolveRetryWakeable를 바인딩한 retry 함수
-      var retry = resolveRetryWakeable.bind(null, finishedWork, wakeable);
-
-      if (!retryCache.has(wakeable)) {
-        retryCache.add(wakeable); // 중복 방지
-        wakeable.then(retry, retry); // Promise resolve/reject 모두 처리
-      }
-    });
-  }
-}
-```
+`RootSuspendedWithDelay` 상태는 Concurrent Mode 전용이다. Transition을 사용하면 React는 이미 표시된 콘텐츠를 숨기는 것을 피하려 한다. 이를 위해 렌더를 즉시 커밋하지 않고 더 기다린다. Legacy Mode에는 이런 개념이 없다.
 
 ---
 
-## 8. Error Boundary: createClassErrorUpdate
+## updateQueue의 이중 생활
 
-**L18743–L18805**: `createClassErrorUpdate`
+React 코드를 읽다 보면 `updateQueue`라는 필드가 컴포넌트 타입에 따라 완전히 다른 구조를 가진다는 것을 발견한다.
 
-```javascript
-// L18743
-function createClassErrorUpdate(fiber, errorInfo, lane) {
-  var update = createUpdate(NoTimestamp, lane);
-  update.tag = CaptureUpdate; // CaptureUpdate = 3 (L14546)
+ClassComponent에서 `updateQueue`는 상태 업데이트들의 링크드 리스트다. `setState`, `forceUpdate` 등이 이 리스트에 쌓이고, `processUpdateQueue`가 이를 순차적으로 처리한다.
 
-  var getDerivedStateFromError = fiber.type.getDerivedStateFromError;
+그런데 SuspenseComponent에서 `updateQueue`는 `Set<Wakeable>`이다. `attachRetryListener`가 이 Set에 Promise를 추가하고, 커밋 단계에서 `attachSuspenseRetryListeners`가 이 Set을 순회하며 retry 함수를 바인딩한다.
 
-  if (typeof getDerivedStateFromError === 'function') {
-    var error$1 = errorInfo.value;
-    // payload는 함수: processUpdateQueue에서 호출되어 새 상태 반환
-    update.payload = function () {
-      return getDerivedStateFromError(error$1);
-    };
-    update.callback = function () {
-      markFailedErrorBoundaryForHotReloading(fiber);
-      logCapturedError(fiber, errorInfo);
-    };
-  }
-
-  var inst = fiber.stateNode;
-  if (inst !== null && typeof inst.componentDidCatch === 'function') {
-    update.callback = function callback() {
-      markFailedErrorBoundaryForHotReloading(fiber);
-      logCapturedError(fiber, errorInfo);
-
-      if (typeof getDerivedStateFromError !== 'function') {
-        // componentDidCatch만 구현한 경우: legacy 에러 경계로 표시
-        markLegacyErrorBoundaryAsFailed(this);
-      }
-
-      var error$1 = errorInfo.value;
-      var stack = errorInfo.stack;
-      // componentDidCatch(error, { componentStack }) 호출
-      this.componentDidCatch(error$1, {
-        componentStack: stack !== null ? stack : ''
-      });
-    };
-  }
-
-  return update;
-}
-```
-
-**L18724–L18742**: `createRootErrorUpdate` — 루트까지 전파된 에러
-
-```javascript
-// L18724
-function createRootErrorUpdate(fiber, errorInfo, lane) {
-  var update = createUpdate(NoTimestamp, lane);
-  update.tag = CaptureUpdate;
-
-  // 루트를 null 렌더로 언마운트
-  update.payload = { element: null };
-
-  var error = errorInfo.value;
-  update.callback = function () {
-    onUncaughtError(error);    // 개발자 콘솔 에러 출력
-    logCapturedError(fiber, errorInfo);
-  };
-
-  return update;
-}
-```
-
-### Update Tag 상수 (L14543–L14546)
-
-```javascript
-var UpdateState = 0;    // setState 등 일반 업데이트
-var ReplaceState = 1;   // replaceState (legacy)
-var ForceUpdate = 2;    // forceUpdate
-var CaptureUpdate = 3;  // Error Boundary 캡처 업데이트
-```
+같은 필드 이름이 완전히 다른 자료구조로 사용된다. 이것은 React의 파이버 구조가 메모리 효율을 위해 필드를 재사용하는 패턴을 따르기 때문이다. `stateNode`도 마찬가지다. ClassComponent에서는 컴포넌트 인스턴스지만, SuspenseComponent에서는 `WeakSet<Wakeable>` 형태의 retry 캐시다. 이 재사용 패턴은 React 파이버 코드를 처음 읽을 때 종종 혼란을 준다.
 
 ---
 
-## 9. Fiber Flags 상수
-
-**L4356–L4408**: 핵심 플래그 값
-
-```javascript
-var Placement           = 2;       // DOM 삽입
-var Update              = 4;       // DOM 업데이트
-var ChildDeletion       = 16;      // 자식 삭제
-var DidCapture          = 128;     // 에러/Suspense 캡처 완료
-var ForceClientRender   = 256;     // Hydration 실패 → 클라이언트 렌더
-var Incomplete          = 32768;   // 렌더 미완료 (throw 발생)
-var ShouldCapture       = 65536;   // 캡처 예정 (throwException에서 설정)
-var ForceUpdateForLegacySuspense = 131072; // Legacy Suspense 강제 업데이트
-```
-
-### ShouldCapture → DidCapture 전환 흐름
+## 설계의 일관성
 
 ```
-throwException()
-  │  suspenseBoundary.flags |= ShouldCapture (L18935 또는 L19010)
-  │  (또는 ClassComponent.flags |= ShouldCapture at L19131)
-  │
-  └─ completeUnitOfWork(erroredWork)
-       └─ unwindWork(current, workInProgress, renderLanes)
-            └─ if (flags & ShouldCapture):
-                 workInProgress.flags = flags & ~ShouldCapture | DidCapture
-                 return workInProgress  ← 이 fiber가 재시작 지점
+컴포넌트 throw (Promise | Error)
+  └─ workLoop catch → handleError
+       └─ throwException: 경계 탐색 + 플래그 설정 + 리스너 등록
+            └─ completeUnitOfWork → unwindWork: 스택 정리 + DidCapture 전환
+                 └─ 경계 파이버로 재시작 → updateSuspenseComponent / updateClassComponent
 ```
+
+이 흐름에서 핵심은 단순함이다.
+
+위의 흐름도에서 볼 수 있듯이, React는 컴포넌트가 무엇을 throw하든 동일한 파이프라인을 통과시킨다. 차이는 `throwException` 내부의 분기뿐이다. 이 통일성은 우연이 아니다. React 팀은 "비동기 대기"와 "에러 복구"를 개념적으로 동일한 문제로 봤다. 둘 다 "현재 컴포넌트가 렌더를 완료할 수 없다"는 신호이고, 둘 다 "가장 가까운 처리 경계를 찾아 위임한다"는 해결책을 가진다.
+
+이 설계는 미래 확장성도 고려한다. 새로운 종류의 비동기 동작이 필요하다면, 새로운 타입의 값을 throw하는 것만으로 통합할 수 있다. Wakeable 인터페이스를 구현한다면 어떤 객체든 Suspense 메커니즘을 활용할 수 있다. React의 캐싱 라이브러리들이 이 패턴을 따르는 것은 그래서다.
 
 ---
 
-## 10. 전체 플로우 시퀀스 다이어그램
+## 마치며: 철학이 구현을 결정한다
 
-### Suspense(Promise) 처리 전체 흐름
+React Suspense와 ErrorBoundary를 이해하는 데 있어 가장 중요한 통찰은 기술적 세부사항이 아니다. "throw는 에러를 알리는 것이 아니라 제어를 위임하는 방법"이라는 설계 철학이다.
 
-```
-[컴포넌트] throw Promise (Wakeable)
-     │
-     ▼
-[renderRootConcurrent] catch (thrownValue)
-     │
-     ▼
-[handleError(root, thrownValue)]
-     │  ├─ resetContextDependencies()
-     │  ├─ resetHooksAfterThrow()
-     │  └─ throwException(root, erroredWork.return, erroredWork, thrownValue, lanes)
-     │       │
-     │       ├─ sourceFiber.flags |= Incomplete
-     │       ├─ getNearestSuspenseBoundaryToCapture(returnFiber)
-     │       │    └─ 순회: node.tag === SuspenseComponent && shouldCaptureSuspense()
-     │       │
-     │       ├─ markSuspenseBoundaryShouldCapture()
-     │       │    └─ [ConcurrentMode] suspenseBoundary.flags |= ShouldCapture
-     │       │    └─ [LegacyMode]    suspenseBoundary.flags |= DidCapture (직접)
-     │       │
-     │       ├─ attachPingListener(root, wakeable, lanes)
-     │       │    └─ root.pingCache WeakMap에 등록
-     │       │    └─ wakeable.then(pingSuspendedRoot, pingSuspendedRoot)
-     │       │
-     │       └─ attachRetryListener(suspenseBoundary, root, wakeable)
-     │            └─ suspenseBoundary.updateQueue (Set) 에 wakeable 추가
-     │
-     └─ completeUnitOfWork(erroredWork)
-          │  (Incomplete 파이버부터 completeWork → unwindWork 순회)
-          │
-          └─ unwindWork(current, SuspenseBoundaryFiber, lanes)
-               └─ flags & ShouldCapture → flags = ~ShouldCapture | DidCapture
-               └─ popSuspenseContext()
-               └─ return SuspenseBoundaryFiber  ← workInProgress로 설정
-                    │
-                    ▼
-               [workLoopConcurrent 재개]
-                    │
-                    ▼
-               [beginWork → updateSuspenseComponent(current, workInProgress, lanes)]
-                    │  didSuspend = (flags & DidCapture) !== 0  → true
-                    │  showFallback = true
-                    │  workInProgress.flags &= ~DidCapture  (플래그 소비)
-                    │
-                    ├─ [초기 마운트] mountSuspenseFallbackChildren()
-                    │    └─ OffscreenFiber(mode='hidden') + FallbackFiber
-                    │    └─ workInProgress.memoizedState = SUSPENDED_MARKER
-                    │
-                    └─ [업데이트] updateSuspenseFallbackChildren()
-                         └─ 기존 OffscreenFiber 재사용(mode='hidden')
-                         └─ FallbackFiber 생성 또는 재사용
+이 철학에서 모든 구현 결정이 따라온다. workLoop가 `do-while`로 감싸진 이유, 두 단계 플래그(ShouldCapture/DidCapture)가 존재하는 이유, OffscreenComponent가 primary 트리를 보존하는 이유, Ping과 Retry 두 리스너가 분리된 이유 — 이 모두가 "throw는 렌더를 중단하는 게 아니라 재개 지점을 변경한다"는 원칙의 구현이다.
 
-     ▼ (Commit Phase)
-[commitMutationEffects → attachSuspenseRetryListeners]
-     └─ finishedWork.updateQueue(Set<Wakeable>) 순회
-     └─ wakeable.then(resolveRetryWakeable, resolveRetryWakeable)
-
-     ▼ (Promise Resolved)
-[pingSuspendedRoot(root, wakeable, lanes)]  ← attachPingListener 경로
-     └─ pingCache.delete(wakeable)
-     └─ RootSuspendedWithDelay → prepareFreshStack() 즉시 재시작
-     └─ ensureRootIsScheduled(root, eventTime)
-
-[resolveRetryWakeable(boundaryFiber, wakeable)]  ← attachSuspenseRetryListeners 경로
-     └─ retryCache.delete(wakeable)
-     └─ retryTimedOutBoundary(boundaryFiber, retryLane)
-          └─ enqueueConcurrentRenderForLane()
-          └─ markRootUpdated()
-          └─ ensureRootIsScheduled()
-
-     ▼ (재렌더)
-[updateSuspenseComponent: showFallback=false]
-     └─ updateSuspensePrimaryChildren(): OffscreenFiber(mode='visible')
-     └─ workInProgress.memoizedState = null  (SUSPENDED_MARKER 제거)
-```
-
-### Error Boundary 처리 흐름
-
-```
-[컴포넌트] throw Error
-
-[handleError → throwException]
-     └─ getNearestSuspenseBoundaryToCapture()  실패 (에러이므로)
-     └─ renderDidError(createCapturedValueAtFiber(value, sourceFiber))
-     └─ 조상 루프:
-          ClassComponent with getDerivedStateFromError/componentDidCatch:
-            workInProgress.flags |= ShouldCapture
-            enqueueCapturedUpdate(workInProgress, createClassErrorUpdate(...))
-            return
-
-[completeUnitOfWork → unwindWork]
-     └─ ClassComponent.flags: ShouldCapture → DidCapture
-     └─ return ClassComponentFiber
-
-[beginWork → updateClassComponent]
-     └─ processUpdateQueue()
-          └─ CaptureUpdate.payload() → getDerivedStateFromError(error)
-     └─ render(): 에러 UI 반환
-
-[Commit Phase]
-     └─ commitLifeCycles → componentDidCatch(error, { componentStack })
-```
-
----
-
-## 핵심 인사이트 정리
-
-### 1. Throw는 제어 흐름이다
-
-React가 `throw`를 에러가 아닌 **비동기 제어 흐름**으로 활용한다는 점이 핵심이다. Promise를 throw하면 React가 catch하여 대기 상태를 관리하고, Promise가 resolve되면 자동으로 재렌더를 스케줄링한다.
-
-### 2. 두 개의 리스너 전략
-
-| 리스너 | 등록 함수 | 저장 위치 | 역할 |
-|--------|---------|---------|------|
-| Ping Listener | `attachPingListener` | `root.pingCache` (WeakMap) | 렌더 중 바로 재시작 또는 lanes 기록 |
-| Retry Listener | `attachRetryListener` (render) + `attachSuspenseRetryListeners` (commit) | `fiber.stateNode` (WeakSet) | fallback 커밋 후 boundary 재렌더 |
-
-### 3. ShouldCapture → DidCapture 두 단계
-
-`ShouldCapture`는 "이 파이버가 캡처해야 한다"는 의도 표시이고, `unwindWork`를 거쳐 `DidCapture`로 전환될 때 실제로 "캡처했다"는 상태가 된다. `updateSuspenseComponent`는 `DidCapture`를 읽어 `showFallback`을 결정하고, 이 플래그를 소비(`&= ~DidCapture`)한다.
-
-### 4. OffscreenComponent: 숨겨진 Primary 트리
-
-Suspense가 fallback을 표시할 때 primary 트리를 버리지 않는다. `OffscreenComponent`(tag=22)로 감싸서 `mode='hidden'`으로 유지한다. Promise가 resolve되면 `mode='visible'`로 전환하여 primary 트리를 재사용한다.
-
-### 5. Legacy vs Concurrent Mode 차이
-
-| 항목 | Legacy Mode | Concurrent Mode |
-|------|------------|----------------|
-| Ping Listener | 불필요 (sync commit) | `attachPingListener` 등록 |
-| ShouldCapture 처리 | 즉시 `DidCapture` 설정 | unwindWork에서 전환 |
-| Fallback 커밋 | 동기적 즉시 | 지연 가능 (RootSuspendedWithDelay) |
-| Primary 트리 | Incomplete 상태로 커밋 | 완전히 숨김(OffscreenLane) |
+소스 코드의 복잡성은 이 단순한 철학이 실제 프로덕션 환경의 수많은 엣지 케이스(Legacy/Concurrent 모드, Hydration, Transition, Profiler 등)를 처리하면서 누적된 것이다. 핵심 아이디어는 놀라울 만큼 간결하다.
