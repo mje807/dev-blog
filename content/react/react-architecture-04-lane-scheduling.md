@@ -1,2056 +1,247 @@
-# React 아키텍처 심층 분석 (4/14): Lane 스케줄링 시스템
+---
+title: "React는 어떻게 32비트로 세상을 조율하는가 — Lane 스케줄링의 설계 철학"
+date: "2025-02-20"
+tags: [React, Concurrent Mode, Scheduler, Lane, 성능최적화]
+series: "React 아키텍처 심층 분석"
+---
 
-> **React 아키텍처 심층 분석** 시리즈의 네 번째 글입니다. [3편](./react-architecture-03-hooks-system.md)에서 Hooks가 Fiber 위에서 연결 리스트로 상태를 관리하는 방식을 추적했습니다. 이번 편에서는 React의 **우선순위 기반 스케줄링 엔진**을 완전히 해부합니다. 32비트 정수 하나로 31개의 독립 작업을 추적하는 Lane 비트마스크, Entanglement로 업데이트를 묶는 메커니즘, 기아(Starvation)를 방지하는 만료 시스템, 그리고 5ms 단위로 브라우저와 협력하는 Scheduler까지 — `ReactFiberLane.js`와 `Scheduler.js`의 실제 코드를 라인 단위로 추적합니다.
-
-> **참조 소스**: `react-dom@18.3.1 (react-dom.development.js)`, `packages/scheduler/src/forks/Scheduler.js`
+> **React 아키텍처 심층 분석** 시리즈의 네 번째 글입니다. [3편](./react-architecture-03-hooks-system.md)에서 Hooks가 Fiber 위에서 연결 리스트로 상태를 관리하는 방식을 추적했습니다. 이번 편에서는 React가 왜, 그리고 어떻게 32비트 정수 하나로 수십 개의 독립 업데이트를 조율하는지 — 그 설계 철학의 뿌리부터 실제 동작 원리까지 탐구합니다.
 
 ---
 
-## 목차
+## 우선순위를 숫자로 표현하면 무슨 문제가 생기는가
 
-1. [왜 Lane인가 — Expiration에서 Lane으로](#1-왜-lane인가--expiration에서-lane으로)
-2. [32비트 비트마스크 — Lane 상수 전체 지도](#2-32비트-비트마스크--lane-상수-전체-지도)
-3. [getHighestPriorityLane — 2의 보수 트릭](#3-gethighestprioritylane--2의-보수-트릭)
-4. [getNextLanes — 다음 렌더 대상 결정 알고리즘](#4-getnextlanes--다음-렌더-대상-결정-알고리즘)
-5. [requestUpdateLane — 업데이트 Lane 할당 결정 트리](#5-requestupdatelane--업데이트-lane-할당-결정-트리)
-6. [claimNextTransitionLane — 16개 라운드로빈](#6-claimnexttransitionlane--16개-라운드로빈)
-7. [markUpdateLaneFromFiberToRoot — childLanes 전파](#7-markupdatelanefrombertotoroot--childlanes-전파)
-8. [Lane Entanglement — 업데이트를 묶는 메커니즘](#8-lane-entanglement--업데이트를-묶는-메커니즘)
-9. [기아 방지 — markStarvedLanesAsExpired](#9-기아-방지--markstarvedlanesasexpired)
-10. [Concurrent Mode 인터럽트 — prepareFreshStack](#10-concurrent-mode-인터럽트--preparefreshstack)
-11. [startTransition 내부 구현](#11-starttransition-내부-구현)
-12. [useTransition Hook — isPending의 이중 setState 트릭](#12-usetransition-hook--ispending의-이중-setstate-트릭)
-13. [ensureRootIsScheduled — Lane과 Scheduler의 연결점](#13-ensurerootisscheduled--lane과-scheduler의-연결점)
-14. [Scheduler 내부 — 두 개의 Min-heap](#14-scheduler-내부--두-개의-min-heap)
-15. [scheduleCallback — 작업 등록 전체 흐름](#15-schedulecallback--작업-등록-전체-흐름)
-16. [MessageChannel 기반 비동기 스케줄링](#16-messagechannel-기반-비동기-스케줄링)
-17. [performWorkUntilDeadline — 작업 루프의 심장](#17-performworkuntildeadline--작업-루프의-심장)
-18. [shouldYieldToHost — 5ms 시간 슬라이싱](#18-shouldyieldtohost--5ms-시간-슬라이싱)
-19. [continuationCallback — 중단과 재개](#19-continuationcallback--중단과-재개)
-20. [SyncLane 특별 처리 — scheduleMicrotask](#20-synclane-특별-처리--schedulemicrotask)
-21. [Lane 생명주기 — markRootUpdated에서 markRootFinished까지](#21-lane-생명주기--markrootupdated에서-markrootfinished까지)
-22. [전체 흐름 — setState에서 화면 갱신까지](#22-전체-흐름--setstate에서-화면-갱신까지)
+소프트웨어 시스템에서 "우선순위"를 표현하는 가장 자연스러운 방법은 숫자입니다. 큰 값이면 높은 우선순위, 혹은 그 반대. 운영체제 스케줄러도, 작업 큐도 대부분 이렇게 시작합니다. React 역시 마찬가지였습니다.
+
+React 16의 Fiber 재작성과 함께 도입된 Concurrent Mode의 첫 번째 우선순위 시스템은 **Expiration Time**이었습니다. 각 업데이트에 `현재 시각 + 허용 지연`으로 만료 시간을 부여하고, 숫자가 작을수록 더 급한 업데이트로 취급했습니다. 직관적이고 구현도 간단했습니다.
+
+그런데 Concurrent Mode가 실제로 하고 싶은 일을 생각해보면 문제가 보입니다. Concurrent Mode의 핵심 약속은 "여러 업데이트가 동시에, 독립적으로 진행될 수 있다"는 것입니다. 탭을 전환하는 도중에 또 다른 탭으로 바꿀 수 있어야 하고, 검색어를 타이핑하면서 백그라운드에서 무거운 목록이 렌더링되고 있어야 합니다.
+
+그런데 단일 숫자로는 "지금 어떤 업데이트들이 동시에 진행 중인가"를 표현할 수 없습니다. 숫자는 상태의 스냅샷 하나만 담을 수 있기 때문입니다. 이것은 마치 여러 악기가 동시에 연주되는 오케스트라 상태를 단 하나의 음표로 표기하려는 것과 같습니다.
+
+구체적인 실패 시나리오를 떠올려보면 이해가 됩니다. 사용자가 탭 A로 전환하는 `startTransition`을 실행했는데, 렌더링이 절반쯤 진행되던 중 탭 B로 다시 전환하기로 마음을 바꿉니다. React는 탭 A의 렌더 결과를 버리고 탭 B를 처음부터 렌더해야 합니다. 그런데 Expiration Time 방식에서는 두 Transition이 동일한 타임스탬프 범위 안에 있으면 "같은 작업"으로 묶여버렸습니다. 서로 다른 탭 전환을 구별할 열쇠가 없었던 것입니다.
+
+여기에 더해 배치 처리 로직도 임의적이었습니다. "250ms 이내 업데이트는 같이 처리한다"는 임계값은 자의적이었고, 다양한 엣지 케이스를 만들어냈습니다. React 팀은 2020년, 이 모든 문제를 해결하기 위해 완전히 다른 접근법으로 전환했습니다. 바로 **Lane 비트마스크**입니다.
 
 ---
 
-## 1. 왜 Lane인가 — Expiration에서 Lane으로
+## 비트마스크가 가져온 패러다임 전환
 
-React 16의 Fiber 재작성과 함께 등장한 Concurrent Mode는 처음에 **Expiration Time** 기반 우선순위 시스템을 사용했습니다. 각 업데이트는 `currentTime + timeout`으로 계산된 만료 시간을 부여받고, 더 급한 업데이트가 더 작은 만료 시간을 가졌습니다.
+Lane 시스템의 핵심 인사이트는 단순하지만 강력합니다. 우선순위를 하나의 숫자가 아닌 **비트 집합**으로 표현하면, 여러 업데이트가 동시에, 독립적으로 존재할 수 있습니다.
 
-그러나 이 시스템에는 치명적인 한계가 있었습니다.
+32비트 정수는 32개의 독립 비트를 가집니다. 각 비트 위치를 하나의 "레인"으로 사용하면, 단 하나의 변수만으로 "현재 이 레인들의 업데이트가 동시에 진행 중"이라는 상태를 완벽하게 표현할 수 있습니다. 고속도로를 상상해보면 좋습니다. Expiration Time은 도로 위의 차 한 대 속도를 숫자로 나타낸 것이고, Lane은 고속도로의 각 차선이 사용 중인지 아닌지를 한 번에 보여주는 신호판입니다.
 
-**Expiration Time 방식의 문제:**
+React 18은 이 아이디어를 정교하게 구체화했습니다. 31개의 비트 위치(0번~30번)에 각각의 우선순위 의미를 부여했는데, 비트 위치가 낮을수록 더 높은 우선순위입니다. 가장 낮은 비트(bit 0)가 가장 긴급한 SyncHydrationLane이고, 가장 높은 비트들이 백그라운드 Idle 작업에 해당합니다.
 
-```
-문제 1: 배치 처리 로직의 복잡성
-  expTime1 = 1000ms, expTime2 = 1050ms
-  "이 두 업데이트를 같이 처리해야 하는가?"
-  → 임의의 임계값(250ms)을 두어 범위 내 업데이트를 묶음 처리
-  → 이 임계값이 자의적이고 다양한 엣지 케이스를 만들어냄
+이 구조 덕분에 React는 `root.pendingLanes`라는 단 하나의 정수만 보고도 "지금 어떤 우선순위의 업데이트들이 대기 중인가"를 즉시 파악합니다. 여러 Lane이 동시에 켜져 있으면 여러 종류의 업데이트가 동시에 진행 중이라는 의미입니다.
 
-문제 2: 동시 업데이트 추적의 어려움
-  Concurrent Mode에서는 여러 업데이트가 동시에 진행될 수 있어야 함
-  → 단일 숫자로는 "어떤 업데이트들이 현재 진행 중인가?"를 표현할 수 없음
+Lane은 크게 다섯 그룹으로 나뉩니다. 가장 높은 우선순위인 **SyncLane**은 버튼 클릭, 키 입력처럼 사용자가 즉각적인 반응을 기대하는 이산적(discrete) 이벤트에 할당됩니다. 그 다음 **InputContinuousLane**은 드래그, 스크롤처럼 연속적으로 발생하는 이벤트를 담당합니다. **DefaultLane**은 이벤트 핸들러 밖에서 발생하는 일반 `setState`에 사용됩니다. **TransitionLane**은 16개의 레인 풀로 구성되어 있으며 `startTransition`으로 표시된 비긴급 업데이트에 배정됩니다. 마지막으로 **IdleLane**과 **OffscreenLane**은 브라우저가 완전히 한가할 때만 처리해도 되는 백그라운드 작업에 쓰입니다.
 
-문제 3: 독립 Transition 구별 불가
-  탭 A → 탭 B 전환 도중 탭 C로 다시 전환하는 경우
-  → A 렌더링 결과를 버리고 C를 렌더해야 하는데
-  → Expiration Time으로는 이 두 Transition을 구별할 방법이 없음
-```
+---
 
-React 팀은 2020년에 이 시스템을 **Lane 비트마스크**로 전환했습니다. 핵심 인사이트는 단순합니다: **우선순위를 숫자 하나가 아닌 비트 집합으로 표현하면, 여러 업데이트를 동시에 독립적으로 추적할 수 있다.**
+## 최고 우선순위를 찾는 아름다운 연산
+
+Lane 시스템에서 가장 자주 사용되는 연산 중 하나는 "현재 대기 중인 Lane들 중 가장 높은 우선순위, 즉 가장 낮은 비트 위치의 Lane을 하나 추출하는 것"입니다. React는 이 작업을 놀라울 만큼 단순한 방식으로 구현합니다.
+
+2의 보수(Two's Complement) 표현법에는 재미있는 성질이 있습니다. 어떤 정수 `n`에 대해 `n & -n`을 계산하면, 정확히 `n`의 가장 낮은 비트 하나만 남습니다. 비트 연산 특성상 이 과정에서 분기(if문)는 전혀 필요하지 않습니다. 단 하나의 AND 연산으로 완성됩니다.
 
 ```javascript
-// Expiration Time 방식: 하나의 숫자
-currentTime + timeout = 1050 // 이것 하나로 모든 것을 표현해야 함
-
-// Lane 방식: 비트 집합
-pendingLanes = 0b00000000010000000000000001000100
-//             TransitionLane8   DefaultLane  InputContinuousLane
-//             ↑ 3개의 독립 업데이트가 동시에 진행 중임을 한 변수로 표현
-```
-
----
-
-## 2. 32비트 비트마스크 — Lane 상수 전체 지도
-
-React 18은 32비트 정수 하나로 31개의 독립 우선순위 레벨을 표현합니다. 비트 위치가 낮을수록(오른쪽) 높은 우선순위입니다.
-
-```
-비트 위치  30 29 | 28~24  | 23~7         | 6    | 5    | 4    | 3    | 2    | 1    | 0
-           Off  | Retry  | Transition    | TransH| DefH | Def  | ICH  | IC   | Sync |SyncH
-           Idle | Lanes  | Lanes (1~16) |      |      |      |      |      |      |
-```
-
-실제 상수 값 (`react-dom@18.3.1`):
-
-```javascript
-// ReactFiberLane.js 실제 값
-var NoLanes = 0;
-var NoLane  = 0;
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 최고 우선순위 — Sync 계열
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var SyncHydrationLane       =          1; // 0b000...0001  bit 0
-var SyncLane                =          2; // 0b000...0010  bit 1
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 높은 우선순위 — 사용자 입력
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var InputContinuousHydrationLane =     4; // 0b000...0100  bit 2
-var InputContinuousLane          =     8; // 0b000...1000  bit 3
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 중간 우선순위 — 기본 렌더
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var DefaultHydrationLane    =         16; // 0b000...10000  bit 4
-var DefaultLane              =         32; // 0b000..100000  bit 5
-
-// Transition Hydration (one lane)
-var TransitionHydrationLane  =         64; // bit 6
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 낮은 우선순위 — Transition (16개 풀)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var TransitionLane1  =       128; // bit 7
-var TransitionLane2  =       256; // bit 8
-var TransitionLane3  =       512; // bit 9
-var TransitionLane4  =      1024; // bit 10
-var TransitionLane5  =      2048; // bit 11
-var TransitionLane6  =      4096; // bit 12
-var TransitionLane7  =      8192; // bit 13
-var TransitionLane8  =     16384; // bit 14
-var TransitionLane9  =     32768; // bit 15
-var TransitionLane10 =     65536; // bit 16
-var TransitionLane11 =    131072; // bit 17
-var TransitionLane12 =    262144; // bit 18
-var TransitionLane13 =    524288; // bit 19
-var TransitionLane14 =   1048576; // bit 20
-var TransitionLane15 =   2097152; // bit 21
-var TransitionLane16 =   4194304; // bit 22
-
-var TransitionLanes = 8388480; // bit 7~22 전체 OR (16개)
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 아주 낮은 우선순위 — Suspense 재시도 (5개)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var RetryLane1  =   8388608; // bit 23
-var RetryLane2  =  16777216; // bit 24
-var RetryLane3  =  33554432; // bit 25
-var RetryLane4  =  67108864; // bit 26
-var RetryLane5  = 134217728; // bit 27
-
-var RetryLanes  = 260046848; // bit 23~27
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 최저 우선순위 — 백그라운드
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-var SelectiveHydrationLane = 268435456; // bit 28
-var NonIdleLanes            = 536870911; // bit 0~28 전체 (Idle 제외)
-var IdleHydrationLane       = 536870912; // bit 29
-var IdleLane                =1073741824; // bit 30
-var OffscreenLane           =2147483648; // bit 31 (부호 없는 32비트)
-```
-
-### Lane별 용도와 우선순위 해설
-
-| Lane 그룹 | 대표 값 | 할당 시나리오 | 만료 시간 |
-|-----------|---------|--------------|-----------|
-| **SyncLane** | 2 | `flushSync`, 이산 이벤트(click, keydown) | 즉시 |
-| **InputContinuousLane** | 8 | 드래그, 스크롤, mousemove | 250ms |
-| **DefaultLane** | 32 | 일반 `setState` | 5000ms |
-| **TransitionLanes** | 128~4M | `startTransition` 내부 | 5000ms |
-| **RetryLanes** | 8M~134M | Suspense 재시도 | 만료 없음 |
-| **IdleLane** | 1073M | 백그라운드 작업 | 만료 없음 |
-| **OffscreenLane** | 2147M | Activity/숨김 렌더 | 만료 없음 |
-
-**중요한 수정**: 많은 글에서 `SyncLane = 0b10`이라고 표현하지만, 실제 `react-dom@18.3.1`에서 `SyncLane = 2`이고 `SyncHydrationLane = 1`입니다. 비트 위치 기준으로는 `SyncHydrationLane`이 bit 0으로 가장 높은 우선순위입니다.
-
----
-
-## 3. getHighestPriorityLane — 2의 보수 트릭
-
-주어진 lanes 집합에서 가장 높은 우선순위(가장 낮은 비트)의 lane 하나를 추출하는 연산입니다.
-
-```javascript
-// ReactFiberLane.js (실제 코드)
 function getHighestPriorityLane(lanes) {
   return lanes & -lanes;
 }
 ```
 
-단 한 줄이지만 정수 연산의 아름다운 트릭입니다. **2의 보수(Two's Complement)** 성질을 활용합니다.
-
-```
-원리:
-lanes     = 0b00101100  (= 44, 여러 bit 설정된 상태)
--lanes    = 2의 보수 = ~lanes + 1
-            ~0b00101100 = 0b11010011
-             0b11010011 + 1 = 0b11010100
-
-lanes & -lanes = 0b00101100
-               & 0b11010100
-               = 0b00000100  ← 가장 낮은 비트만 남음
-
-실제 예: SyncLane과 DefaultLane이 모두 pending인 경우
-pendingLanes = SyncLane | DefaultLane = 2 | 32 = 34
-             = 0b00100010
-
-getHighestPriorityLane(34):
-  34       = 0b00100010
-  -34      = 0b11011110  (2의 보수)
-  34 & -34 = 0b00000010  = 2 = SyncLane  ← 더 높은 우선순위(낮은 비트) 추출
-```
-
-이 연산은 분기(branch) 없이 **단일 AND 연산**으로 최고 우선순위 lane을 추출합니다. 매 렌더 사이클마다 수백 번 호출되는 핫 패스에서 성능이 중요합니다.
-
-### getHighestPriorityLanes (복수형)
-
-같은 우선순위 그룹의 모든 lane을 반환하는 변형도 있습니다:
-
-```javascript
-function getHighestPriorityLanes(lanes) {
-  // SyncLane 체크
-  switch (getHighestPriorityLane(lanes)) {
-    case SyncHydrationLane:
-      return SyncHydrationLane;
-    case SyncLane:
-      return SyncLane;
-    case InputContinuousHydrationLane:
-      return InputContinuousHydrationLane;
-    case InputContinuousLane:
-      return InputContinuousLane;
-    case DefaultHydrationLane:
-      return DefaultHydrationLane;
-    case DefaultLane:
-      return DefaultLane;
-    case TransitionHydrationLane:
-      return TransitionHydrationLane;
-    case TransitionLane1:
-    case TransitionLane2:
-    // ... TransitionLane16 까지
-      return lanes & TransitionLanes;  // ← Transition은 전체 묶음 반환
-    case RetryLane1:
-    // ... RetryLane5 까지
-      return lanes & RetryLanes;       // ← Retry도 묶음 반환
-    // ...
-  }
-}
-```
-
-Transition과 Retry는 개별 lane이 아닌 해당 그룹 전체를 한 번에 반환합니다. 이 그룹들은 유사한 우선순위를 가지므로 함께 처리하는 것이 효율적입니다.
+이 코드에서 핵심은 `-lanes`가 2의 보수, 즉 `~lanes + 1`이라는 점입니다. 예를 들어 SyncLane(값 2)과 DefaultLane(값 32)이 동시에 대기 중이라면 `pendingLanes = 34`입니다. `34 & -34`를 계산하면 정확히 `2`, 즉 SyncLane만 남습니다. 매 렌더 사이클마다 수백 번 호출되는 핫 패스에서 분기 없는 단일 연산은 의미 있는 성능 차이를 만들어냅니다.
 
 ---
 
-## 4. getNextLanes — 다음 렌더 대상 결정 알고리즘
+## React가 다음에 무엇을 처리할지 결정하는 방법
 
-React가 다음 렌더링 사이클에서 어떤 작업을 처리할지 결정하는 핵심 함수입니다.
+`getNextLanes`는 React가 다음 렌더링 사이클에서 어떤 Lane을 처리할지 결정하는 알고리즘입니다. 이 함수의 설계는 Lane 시스템의 정교함이 집약된 곳이기도 합니다.
 
-```javascript
-// ReactFiberLane.js 실제 구현 분석
-function getNextLanes(root, wipLanes) {
-  // ══════════════════════════════════════════════
-  // Step 1: 대기 중인 작업이 없으면 조기 종료
-  // ══════════════════════════════════════════════
-  var pendingLanes = root.pendingLanes;
-  if (pendingLanes === NoLanes) {
-    return NoLanes;
-  }
+결정 과정은 여러 단계를 거칩니다. 먼저 대기 중인 Lane들을 확인하고, 그 중 Suspense 때문에 블로킹된 것들을 제외합니다. Suspense로 블로킹된 Lane은 Promise가 resolve되어 "핑(ping)"을 받기 전까지는 처리할 수 없기 때문입니다. Idle보다 높은 우선순위 작업이 있다면 Idle보다 먼저 처리합니다.
 
-  var nextLanes = NoLanes;
-  var suspendedLanes = root.suspendedLanes;
-  var pingedLanes = root.pingedLanes;
+여기서 흥미로운 부분은 인터럽트 판단 로직입니다. 현재 렌더가 진행 중인 상황에서 새로운 업데이트가 들어오면, 기존 렌더를 중단해야 할까요? React의 대답은 "항상 그런 건 아닙니다"입니다.
 
-  // ══════════════════════════════════════════════
-  // Step 2: Non-Idle 작업 처리 (우선순위 높은 쪽)
-  // ══════════════════════════════════════════════
-  var nonIdlePendingLanes = pendingLanes & NonIdleLanes;
-  if (nonIdlePendingLanes !== NoLanes) {
+새 업데이트의 우선순위가 현재 진행 중인 작업보다 낮거나 같다면, 굳이 중단할 이유가 없습니다. 특히 흥미로운 예외 규칙이 하나 있습니다. 일반 `setState`가 발생해서 DefaultLane이 추가되더라도, 이미 TransitionLane 렌더링이 진행 중이라면 이를 인터럽트하지 않습니다. DefaultLane 업데이트는 Transition 렌더가 끝난 뒤 함께 반영될 수 있기 때문입니다. 쓸데없는 중단을 피해 렌더링 효율을 높이는 섬세한 설계입니다.
 
-    // 2a. Suspended되지 않은 Non-Idle lanes 우선 처리
-    var nonIdleUnblockedLanes = nonIdlePendingLanes & ~suspendedLanes;
-    if (nonIdleUnblockedLanes !== NoLanes) {
-      nextLanes = getHighestPriorityLanes(nonIdleUnblockedLanes);
-    } else {
-      // 2b. 모두 Suspended → Pinged된 것 처리 (Promise resolved)
-      var nonIdlePingedLanes = nonIdlePendingLanes & pingedLanes;
-      if (nonIdlePingedLanes !== NoLanes) {
-        nextLanes = getHighestPriorityLanes(nonIdlePingedLanes);
-      }
-      // 2c. Suspended이고 아직 Ping도 안 받음 → 아무것도 처리 불가
-    }
-  } else {
-    // ══════════════════════════════════════════════
-    // Step 3: Idle 전용 작업 처리
-    // ══════════════════════════════════════════════
-    var unblockedLanes = pendingLanes & ~suspendedLanes;
-    if (unblockedLanes !== NoLanes) {
-      nextLanes = getHighestPriorityLanes(unblockedLanes);
-    } else {
-      if (pingedLanes !== NoLanes) {
-        nextLanes = getHighestPriorityLanes(pingedLanes);
-      }
-    }
-  }
-
-  if (nextLanes === NoLanes) {
-    return NoLanes;
-  }
-
-  // ══════════════════════════════════════════════
-  // Step 4: 현재 렌더 중인 작업(wipLanes) 인터럽트 여부 결정
-  // ══════════════════════════════════════════════
-  if (wipLanes !== NoLanes && wipLanes !== nextLanes) {
-    var nextLane = getHighestPriorityLane(nextLanes);
-    var wipLane  = getHighestPriorityLane(wipLanes);
-
-    if (
-      // 새 작업의 우선순위가 현재 작업보다 낮거나 같음
-      nextLane >= wipLane ||
-      // 예외: DefaultLane은 TransitionLane 작업을 인터럽트하지 않음
-      (nextLane === DefaultLane && (wipLane & TransitionLanes) !== NoLanes)
-    ) {
-      return wipLanes; // 현재 작업 계속 진행 (인터럽트 안 함)
-    }
-  }
-
-  // ══════════════════════════════════════════════
-  // Step 5: InputContinuousLane이 있으면 DefaultLane 배치 처리
-  // ══════════════════════════════════════════════
-  if ((nextLanes & InputContinuousLane) !== NoLanes) {
-    // 연속 입력 처리 시 일반 업데이트도 함께 묶음 처리
-    nextLanes |= pendingLanes & DefaultLane;
-  }
-
-  // ══════════════════════════════════════════════
-  // Step 6: Entanglement 적용
-  // ══════════════════════════════════════════════
-  var entangledLanes = root.entangledLanes;
-  if (entangledLanes !== NoLanes) {
-    var entanglements = root.entanglements;
-    var lanes = nextLanes & entangledLanes;
-    while (lanes > 0) {
-      var index = pickArbitraryLaneIndex(lanes);
-      var lane = 1 << index;
-      nextLanes |= entanglements[index]; // 얽힌 lane들 모두 포함
-      lanes &= ~lane;
-    }
-  }
-
-  return nextLanes;
-}
-```
-
-### 핵심 결정 흐름도
-
-```
-pendingLanes 확인
-    │
-    ├─ NonIdle lanes 있음?
-    │     │
-    │     ├─ Unblocked(non-suspended) 있음? → 그 중 최고 우선순위
-    │     └─ 전부 Suspended?
-    │             └─ Pinged(Promise resolved) 있음? → 그 중 최고 우선순위
-    │
-    └─ Idle lanes만?
-          ├─ Unblocked 있음? → 최고 우선순위
-          └─ 전부 Suspended → Pinged 중 선택
-
-nextLanes 결정 후:
-    │
-    ├─ wipLanes와 충돌?
-    │     └─ nextLane >= wipLane → 인터럽트 않고 wipLanes 유지
-    │        (DefaultLane은 TransitionLane 인터럽트 안 함)
-    │
-    ├─ InputContinuousLane → DefaultLane 함께 배치
-    │
-    └─ Entanglement 추가 (얽힌 lane들 포함)
-```
-
-**Step 4의 인터럽트 규칙 상세**:
-
-```
-예시: 현재 TransitionLane5 렌더 중에 DefaultLane 업데이트 도착
-
-nextLane = DefaultLane (= 32)
-wipLane  = TransitionLane5 (= 2048)
-
-조건: nextLane === DefaultLane && (wipLane & TransitionLanes) !== 0
-     32 === 32 && (2048 & TransitionLanes) !== 0  ← 참
-→ 인터럽트하지 않음 → TransitionLane5 계속 렌더
-
-이유: DefaultLane 업데이트(일반 setState)가 도착해도
-     이미 시작된 Transition 렌더를 중단할 필요가 없음.
-     Transition이 완료되면 DefaultLane도 같이 반영됨.
-```
+이 외에도 `getNextLanes`는 InputContinuousLane 처리 시 DefaultLane을 배치로 묶는 최적화, 그리고 Entanglement(아래에서 설명)를 반영하는 처리를 수행합니다.
 
 ---
 
-## 5. requestUpdateLane — 업데이트 Lane 할당 결정 트리
+## setState가 어떤 Lane을 받는지 결정하는 순간
 
-`setState`나 `dispatchSetState`가 호출될 때, 이 업데이트가 어떤 Lane을 받아야 하는지 결정하는 함수입니다.
+`setState`를 호출하는 순간, React는 이 업데이트가 얼마나 급한지 판단해야 합니다. 이 판단을 담당하는 함수가 `requestUpdateLane`입니다.
 
-```javascript
-// ReactFiberLane.js 실제 구현
-function requestUpdateLane(fiber) {
-  var mode = fiber.mode;
+가장 먼저 확인하는 것은 현재 컨텍스트입니다. Legacy Mode(`ReactDOM.render`)라면 무조건 SyncLane입니다. Concurrent Mode라면 여러 가능성을 순서대로 확인합니다.
 
-  // ══════════════════════════════════════════════
-  // Case 1: Legacy Mode (ReactDOM.render)
-  // ConcurrentMode 비트가 없으면 항상 SyncLane
-  // ══════════════════════════════════════════════
-  if ((mode & ConcurrentMode) === NoMode) {
-    return SyncLane;
-  }
+현재 `startTransition` 블록 안에서 실행 중이라면 TransitionLane을 할당합니다. `flushSync`처럼 명시적으로 우선순위를 강제한 컨텍스트라면 그 우선순위를 따릅니다. 그 어느 것도 아니라면, React는 현재 처리 중인 DOM 이벤트 타입을 보고 우선순위를 추론합니다.
 
-  // ══════════════════════════════════════════════
-  // Case 2: 렌더 중 setState (render phase update)
-  // ══════════════════════════════════════════════
-  if (
-    (executionContext & RenderContext) !== NoContext &&
-    workInProgressRootRenderLanes !== NoLanes
-  ) {
-    // 현재 렌더 중인 lane과 동일한 lane 사용
-    // → 같은 렌더 패스에서 처리됨 (RE_RENDER_LIMIT 적용)
-    return pickArbitraryLane(workInProgressRootRenderLanes);
-  }
+DOM 이벤트 타입과 Lane의 대응 관계는 직관적입니다. `click`, `keydown`, `mousedown`처럼 사용자가 즉각적인 반응을 기대하는 이산 이벤트는 SyncLane을 받습니다. `mousemove`, `scroll`, `drag`처럼 연속으로 발생하는 이벤트는 InputContinuousLane을 받습니다. 그리고 `setTimeout`이나 `Promise.then` 안에서 발생하는 `setState`처럼 이벤트 핸들러 밖에서 호출되는 경우는 DefaultLane을 받습니다.
 
-  // ══════════════════════════════════════════════
-  // Case 3: startTransition 컨텍스트 내부
-  // ══════════════════════════════════════════════
-  var isTransition = requestCurrentTransition() !== NoTransition;
-  if (isTransition) {
-    if (currentEventTransitionLane === NoLane) {
-      // 이 이벤트에서 처음 Transition 요청 → 새 lane 할당
-      currentEventTransitionLane = claimNextTransitionLane();
-    }
-    // 같은 이벤트 내 모든 Transition은 동일 lane 공유
-    return currentEventTransitionLane;
-  }
-
-  // ══════════════════════════════════════════════
-  // Case 4: 명시적 우선순위 설정 (flushSync, batchedUpdates 등)
-  // ══════════════════════════════════════════════
-  var updateLane = getCurrentUpdatePriority();
-  if (updateLane !== NoLane) {
-    return updateLane;
-  }
-
-  // ══════════════════════════════════════════════
-  // Case 5: React 이벤트 핸들러 외부에서 호출
-  // DOM 이벤트 타입으로 우선순위 추론
-  // ══════════════════════════════════════════════
-  var eventLane = getCurrentEventPriority();
-  return eventLane;
-}
-```
-
-### DOM 이벤트 타입 → Lane 매핑
-
-`getCurrentEventPriority()`는 `window.event.type`을 읽어 Lane을 결정합니다:
-
-```javascript
-function getEventPriority(domEventName) {
-  switch (domEventName) {
-    // 이산 이벤트 (Discrete) → SyncLane
-    // 사용자가 클릭/타이핑을 기다리므로 즉시 반응해야 함
-    case 'click':
-    case 'keydown':
-    case 'keyup':
-    case 'mousedown':
-    case 'mouseup':
-    case 'touchstart':
-    case 'touchend':
-    case 'blur':
-    case 'focus':
-    case 'select':
-    case 'submit':
-      return DiscreteEventPriority; // = SyncLane
-
-    // 연속 이벤트 (Continuous) → InputContinuousLane
-    // 빠르게 계속 발생하므로 배치 처리 가능
-    case 'drag':
-    case 'dragenter':
-    case 'mousemove':
-    case 'scroll':
-    case 'touchmove':
-    case 'wheel':
-    case 'pointermove':
-      return ContinuousEventPriority; // = InputContinuousLane
-
-    // 기타 → DefaultLane
-    default:
-      return DefaultEventPriority; // = DefaultLane
-  }
-}
-```
-
-### `getCurrentUpdatePriority` vs `getCurrentEventPriority`
-
-```javascript
-// getCurrentUpdatePriority: 코드에서 명시적으로 설정한 우선순위
-var currentUpdatePriority = NoLane;
-
-// flushSync가 이것을 설정함
-function flushSync(fn) {
-  setCurrentUpdatePriority(DiscreteEventPriority); // SyncLane으로 강제
-  try {
-    return fn(); // fn 내부 setState는 SyncLane 받음
-  } finally {
-    setCurrentUpdatePriority(previousPriority); // 복구
-    flushSyncCallbacks(); // 동기적으로 플러시
-  }
-}
-
-// getCurrentEventPriority: window.event 읽어서 추론
-// → React 이벤트 핸들러 밖에서 setTimeout이나 Promise.then으로
-//   setState 호출 시 사용됨 (window.event가 null → DefaultLane)
-```
+이 설계의 핵심은 "사용자가 기대하는 반응 속도"를 시스템이 자동으로 추론한다는 점입니다. 개발자가 매번 우선순위를 명시하지 않아도, React가 맥락을 읽고 적절한 레인을 결정합니다.
 
 ---
 
-## 6. claimNextTransitionLane — 16개 라운드로빈
+## Transition은 왜 16개의 레인이 필요한가
 
-`startTransition` 내에서 처음 setState를 호출할 때, 이 Transition이 어떤 TransitionLane을 사용할지 결정합니다.
+`startTransition`을 호출할 때마다 React는 16개의 TransitionLane 풀에서 레인 하나를 순환 방식(round-robin)으로 할당합니다. 그런데 왜 굳이 16개나 될까요?
 
-```javascript
-// ReactFiberLane.js
-var nextTransitionLane = TransitionLane1; // 전역 변수, 128에서 시작
+탭 전환 시나리오를 다시 떠올려봅시다. 사용자가 탭 A로 전환하는 Transition을 시작했는데, 렌더가 완료되기 전에 탭 B로 전환하는 Transition을 또 시작합니다. 만약 두 Transition이 같은 Lane을 사용한다면, React는 이 두 작업을 구별할 수 없습니다. 탭 A 렌더를 버리고 탭 B를 처음부터 시작해야 하는지, 아니면 탭 A를 완료한 뒤 탭 B를 처리해야 하는지 알 방법이 없습니다.
 
-function claimNextTransitionLane() {
-  // 현재 lane을 반환하고 다음으로 이동
-  var lane = nextTransitionLane;
-  nextTransitionLane <<= 1; // 비트를 왼쪽으로 한 칸 시프트
+서로 다른 Lane을 배정받으면 이야기가 달라집니다. TransitionLane1이 탭 A 전환 중이라는 것을 알고, TransitionLane2가 탭 B로의 전환임을 별도로 추적할 수 있습니다. 새 Transition이 들어오면 이전 Transition의 렌더를 인터럽트하고 새 Lane으로 다시 시작할 수 있습니다.
 
-  // TransitionLanes 범위를 벗어나면 처음으로 돌아옴
-  if ((nextTransitionLane & TransitionLanes) === 0) {
-    nextTransitionLane = TransitionLane1;
-  }
+16개라는 숫자는 실용적 타협입니다. 32비트 중 SyncLane, InputContinuous, Default, Retry(5개), Idle, Offscreen 등을 제외하고 남은 비트 중 16개를 Transition에 배정했습니다. 실제 사용 패턴에서 동시에 16개 이상의 서로 다른 Transition이 겹치는 경우는 거의 없고, 풀이 순환되기 전에 이전 Transition들이 완료되는 것이 일반적입니다.
 
-  return lane;
-}
-```
-
-### 라운드로빈 시각화
-
-```
-순환 순서: 128 → 256 → 512 → ... → 4194304 → 128 → ...
-
-사용 예:
-  이벤트1의 startTransition → TransitionLane1 (128)
-  이벤트2의 startTransition → TransitionLane2 (256)
-  이벤트3의 startTransition → TransitionLane3 (512)
-  ...
-  이벤트17의 startTransition → TransitionLane1 (128) ← 재사용 시작
-
-동일 이벤트 내 여러 startTransition:
-  onClick: {
-    startTransition(A) → currentEventTransitionLane = TransitionLane5
-    startTransition(B) → currentEventTransitionLane 재사용 = TransitionLane5
-  }
-  // 이벤트 종료 후 currentEventTransitionLane = NoLane 리셋
-
-다음 onClick:
-    startTransition(C) → claimNextTransitionLane() = TransitionLane6 (새 lane)
-```
-
-### 왜 16개인가?
-
-```
-TransitionLane 개수 선택의 이유:
-
-1. 32비트 중 할당 가능한 비트 수 제한
-   SyncLane, InputContinuous, Default, Retry(5개), Idle, Offscreen 등
-   기타 lane에 할당하고 남은 비트 중 16개를 Transition에 배정
-
-2. 동시 독립 Transition 추적의 실용적 한계
-   16개 풀이 소진되기 전에 이전 Transition들이 완료되는 것이 일반적
-
-3. Starvation 방지
-   16개 순환 시 같은 lane이 재사용되기 전
-   최소 15개의 다른 Transition이 먼저 처리될 기회를 가짐
-```
+동일한 이벤트 안에서 여러 `startTransition`을 호출하면 어떻게 될까요? React는 하나의 이벤트 안에서는 같은 TransitionLane을 공유합니다. 이벤트가 끝나면 레인 캐시를 초기화하고, 다음 이벤트부터 새 레인을 할당합니다. 이 덕분에 같은 이벤트에서 발생한 여러 Transition은 자연스럽게 하나의 배치로 묶입니다.
 
 ---
 
-## 7. markUpdateLaneFromFiberToRoot — childLanes 전파
+## childLanes: 변경이 없는 서브트리를 통째로 건너뛰는 비법
 
-`setState`가 발생한 Fiber에서 루트까지 모든 조상 Fiber의 `childLanes`를 업데이트합니다. 이 전파가 React의 **선택적 렌더링**을 가능하게 하는 핵심 메커니즘입니다.
+React가 전체 컴포넌트 트리를 매번 순회하지 않는다는 것은 알려진 사실입니다. 그런데 어떻게 "이 서브트리 안에는 변경이 없다"는 것을 효율적으로 알 수 있을까요?
 
-```javascript
-// ReactFiberLane.js
-function markUpdateLaneFromFiberToRoot(sourceFiber, lane) {
-  // ① 업데이트 발생 Fiber 자신의 lanes 업데이트
-  sourceFiber.lanes = mergeLanes(sourceFiber.lanes, lane);
-  var alternate = sourceFiber.alternate;
-  if (alternate !== null) {
-    alternate.lanes = mergeLanes(alternate.lanes, lane); // WIP도 동일하게
-  }
+비밀은 `childLanes`라는 필드에 있습니다. `setState`가 특정 Fiber에서 발생하면, React는 해당 Fiber의 `lanes`를 업데이트하는 데 그치지 않고, 루트까지의 모든 조상 Fiber의 `childLanes`에도 같은 Lane을 추가합니다. 이 과정을 `markUpdateLaneFromFiberToRoot`라 합니다.
 
-  // ② 루트까지 올라가며 모든 조상의 childLanes 업데이트
-  var node = sourceFiber;
-  var parent = sourceFiber.return;
+그 결과, 루트 Fiber를 보는 것만으로 "이 트리 안의 어딘가에 N번 레인의 업데이트가 있다"는 사실을 알 수 있습니다. 렌더링 중에 특정 Fiber의 `childLanes`를 현재 렌더링 중인 Lane과 비교했을 때 교집합이 없다면, 그 서브트리 전체를 재귀 없이 즉시 건너뜁니다. 크고 복잡한 트리에서 실제 변경이 발생한 Fiber 하나만을 효율적으로 찾아낼 수 있는 이유입니다.
 
-  while (parent !== null) {
-    parent.childLanes = mergeLanes(parent.childLanes, lane);
-    var alternate = parent.alternate;
-    if (alternate !== null) {
-      alternate.childLanes = mergeLanes(alternate.childLanes, lane);
-    }
-    node = parent;
-    parent = parent.return;
-  }
-
-  // ③ HostRoot 도달 시 FiberRoot 반환
-  if (node.tag === HostRoot) {
-    var root = node.stateNode;
-    return root;
-  }
-  return null;
-}
-```
-
-### childLanes의 역할: 서브트리 건너뛰기
-
-```
-FiberRoot
-    └─ HostRoot Fiber [childLanes |= lane]
-           └─ App Fiber [childLanes |= lane]
-                  └─ Layout Fiber [childLanes |= lane]
-                         ├─ Sidebar Fiber [childLanes = 0] ← 업데이트 없음
-                         └─ Content Fiber [childLanes |= lane]
-                                └─ Button Fiber [lanes |= lane] ← setState 발생
-```
-
-렌더링 중 `beginWork`가 각 Fiber를 방문할 때:
-
-```javascript
-function beginWork(current, workInProgress, renderLanes) {
-  // childLanes와 renderLanes에 교집합이 없으면
-  // 이 서브트리 전체를 재귀 없이 즉시 건너뜀 (bailout)
-  if (
-    !includesSomeLane(renderLanes, workInProgress.childLanes) &&
-    !includesSomeLane(renderLanes, workInProgress.lanes)
-  ) {
-    return null; // 이 Fiber 아래 모든 것을 스킵
-  }
-  // ... 실제 렌더링
-}
-```
-
-`Sidebar Fiber`의 `childLanes = 0`이므로 해당 서브트리는 완전히 건너뜁니다. 이것이 React가 전체 트리를 순회하지 않고 변경된 부분만 재렌더하는 실제 메커니즘입니다.
-
-### 비트 연산 유틸리티
-
-```javascript
-// Lane 집합 연산
-function mergeLanes(a, b)        { return a | b;   }  // 합집합: lane 추가
-function removeLanes(set, subset){ return set & ~subset; } // 차집합: lane 제거
-function intersectLanes(a, b)    { return a & b;   }  // 교집합
-function includesSomeLane(a, b)  { return (a & b) !== NoLanes; } // 교집합 비어있지 않음?
-function isSubsetOfLanes(set, subset) { return (set & subset) === subset; } // 부분집합?
-```
+이 메커니즘은 React의 선택적 렌더링(selective rendering)을 실제로 구현하는 핵심입니다. `React.memo`나 `shouldComponentUpdate` 같은 최적화는 이 위에 추가로 얹힌 레이어이고, 아래에서 `childLanes` 비교가 서브트리 전체를 먼저 거르고 있습니다.
 
 ---
 
-## 8. Lane Entanglement — 업데이트를 묶는 메커니즘
+## Entanglement: "이 업데이트들은 반드시 함께 화면에 나타나야 한다"
 
-Entanglement는 "이 lane들은 반드시 같은 렌더 배치에서 함께 처리되어야 한다"는 제약입니다. 중간 상태를 사용자에게 노출하지 않기 위한 안전장치입니다.
+화면에 중간 상태가 노출되는 것은 사용자 경험에 치명적입니다. 목록이 절반만 업데이트된 상태, 버튼은 눌렸는데 스피너가 뜨지 않은 상태 — 이런 순간들은 앱이 깨진 것처럼 보이게 만듭니다.
 
-### FiberRoot의 Entanglement 관련 필드
+React의 Entanglement 시스템은 이 문제를 구조적으로 방지합니다. "이 Lane들은 반드시 같은 커밋(commit)에서 함께 처리되어야 한다"는 제약을 시스템 수준에서 강제하는 메커니즘입니다.
 
-```typescript
-type FiberRoot = {
-  // 얽혀있는 lane들의 합집합
-  entangledLanes: Lanes;
+탭 전환 시나리오에서 Entanglement가 어떻게 작동하는지 살펴봅시다. 같은 상태를 건드리는 두 Transition이 있을 때 — 탭 A 전환(TransitionLane1)이 진행 중인데 탭 B 전환(TransitionLane2)이 시작되면 — React는 이 두 Lane을 서로 얽습니다. 얽힌 Lane들은 한쪽을 처리할 때 다른 쪽도 반드시 포함해야 합니다. 이 덕분에 탭 A의 절반만 렌더된 중간 상태가 화면에 나타나는 일이 없습니다.
 
-  // 인덱스 = lane의 비트 위치
-  // 값 = 이 lane과 함께 처리되어야 할 lane들의 집합
-  entanglements: LaneMap<Lanes>; // 31개 원소 배열
-};
-```
+Entanglement에는 전이성(transitivity)이 있습니다. A와 B가 얽혀 있고, B와 C가 얽혀 있다면 A와 C도 자동으로 얽힙니다. `markRootEntangled`는 이 전이적 관계를 매번 계산하여 `entanglements` 배열(각 Lane 인덱스를 키로 쓰는 31개짜리 배열)에 기록합니다.
 
-### markRootEntangled 전체 구현
-
-```javascript
-// ReactFiberLane.js
-function markRootEntangled(root, entangledLanes) {
-  // 1. root의 entangledLanes 갱신
-  var rootEntangledLanes = (root.entangledLanes |= entangledLanes);
-
-  // 2. entanglements 배열 업데이트
-  var entanglements = root.entanglements;
-  var lanes = rootEntangledLanes;
-
-  while (lanes > 0) {
-    var index = pickArbitraryLaneIndex(lanes); // CTZ(Counting Trailing Zeros)
-    var lane = 1 << index;
-
-    // 조건 1: 이 lane이 새로 얽힌 lane들 중 하나이거나
-    // 조건 2: 이미 이 lane과 얽혀있던 lane이 새 entangledLanes와 겹치는 경우
-    //         → 전이적(Transitive) Entanglement
-    if (
-      (lane & entangledLanes) !== 0 ||
-      (entanglements[index] & entangledLanes) !== 0
-    ) {
-      entanglements[index] |= entangledLanes;
-    }
-
-    lanes &= ~lane; // 처리한 lane 제거
-  }
-}
-```
-
-### 전이적 Entanglement 예제
-
-```
-Step 1: markRootEntangled(root, A | B)
-  → entanglements[A] = A | B
-  → entanglements[B] = A | B
-
-Step 2: markRootEntangled(root, B | C)
-  rootEntangledLanes = A | B | C
-
-  lane=A 처리:
-    (A & (B|C)) = 0          ← A는 새 entangledLanes에 없음
-    (entanglements[A] & (B|C)) = (A|B) & (B|C) = B ≠ 0  ← 전이!
-    → entanglements[A] |= (B|C)
-    → entanglements[A] = A | B | C  ← A가 C와도 얽힘!
-
-  lane=B, C: 유사하게 처리
-
-결과: A, B, C 중 어느 하나를 렌더할 때 나머지 모두 포함
-```
-
-### 실제 Entanglement 발생 시나리오
-
-**Transition 간 Entanglement**:
-
-```javascript
-// dispatchSetState에서 호출 (useReducer/useState)
-function entangleTransitionUpdate(root, queue, lane) {
-  if (isTransitionLane(lane)) {
-    var queueLanes = queue.lanes;
-    // 이미 처리된 lane은 제거 (GC)
-    queueLanes = intersectLanes(queueLanes, root.pendingLanes);
-
-    // 현재 update lane과 queue의 기존 Transition lane들 합집합
-    var newQueueLanes = mergeLanes(queueLanes, lane);
-    queue.lanes = newQueueLanes;
-
-    // 동일 상태 큐를 업데이트하는 모든 Transition을 묶음
-    markRootEntangled(root, newQueueLanes);
-  }
-}
-```
-
-```
-탭 전환 시나리오:
-  t=0:    startTransition(() => setTab('A'))  → TransitionLane1
-          queue.lanes = TransitionLane1
-
-  t=50ms: startTransition(() => setTab('B'))  → TransitionLane2
-          newQueueLanes = TransitionLane1 | TransitionLane2
-          markRootEntangled → 두 lane 얽힘
-
-  결과: TransitionLane1 렌더 시 TransitionLane2도 포함
-       → 탭 A 중간 상태를 스킵하고 탭 B로 직행
-```
-
-**Hydration Entanglement**:
-
-```javascript
-// Hydration 중 SyncHydrationLane과 SyncLane을 묶음
-markRootEntangled(root, SyncHydrationLane | SyncLane);
-
-// 이유: SSR hydration 도중 click 이벤트 발생 시
-// hydration 완료와 이벤트 처리를 같은 배치로 묶어
-// 반쪽만 hydrated된 상태에서 이벤트가 처리되는 것 방지
-```
-
-### getEntangledLanes — nextLanes에 Entanglement 반영
-
-```javascript
-// getNextLanes의 마지막 단계에서 호출
-function getEntangledLanes(root, renderLanes) {
-  var entangledLanes = renderLanes;
-
-  if (
-    root.entangledLanes !== NoLanes &&
-    (root.entangledLanes & renderLanes) !== NoLanes
-  ) {
-    var entanglements = root.entanglements;
-    var lanes = entangledLanes & root.entangledLanes;
-
-    // renderLanes에 포함된 각 entangled lane의 파트너들 추가
-    while (lanes > 0) {
-      var index = pickArbitraryLaneIndex(lanes);
-      var lane = 1 << index;
-      entangledLanes |= entanglements[index]; // 얽힌 lane 모두 포함
-      lanes &= ~lane;
-    }
-  }
-
-  return entangledLanes;
-}
-```
+`useTransition`의 `isPending` 상태도 Entanglement를 활용합니다. `setPending(true)`는 SyncLane으로 즉시 실행되어 사용자에게 로딩 스피너를 바로 보여주고, `setPending(false)`는 실제 콘텐츠 업데이트와 같은 TransitionLane에 얽혀 있어 콘텐츠가 준비되기 전에는 절대 스피너가 사라지지 않습니다. 이 보장을 코드 한 줄로 주입한 것이 아니라, Lane 시스템의 Entanglement 구조로 자연스럽게 달성한다는 점이 설계의 우아함입니다.
 
 ---
 
-## 9. 기아 방지 — markStarvedLanesAsExpired
+## 기아(Starvation): 낮은 우선순위 작업이 영원히 밀리지 않도록
 
-Concurrent Mode에서 고우선순위 업데이트가 계속 들어오면, 낮은 우선순위의 Transition 업데이트가 무한정 처리되지 못하는 **기아(Starvation)** 문제가 발생할 수 있습니다.
+Concurrent Mode에서 고우선순위 업데이트가 계속 들어온다면, 낮은 우선순위의 Transition은 언제 처리될까요? 이론적으로는 영원히 밀릴 수 있습니다. 이것이 **기아(Starvation)** 문제입니다.
 
-React는 각 lane에 만료 시간을 부여하여 이를 방지합니다.
+React는 각 Lane에 만료 시간을 부여하여 이 문제를 해결합니다. 처음 업데이트가 등록될 때는 만료 시간이 없습니다. 그런데 첫 번째 렌더 시도 때 `markStarvedLanesAsExpired`가 호출되면서 카운트다운이 시작됩니다. DefaultLane과 TransitionLane은 5초, SyncLane 계열은 즉시, Idle과 Retry Lane은 만료가 없습니다.
 
-### computeExpirationTime — Lane별 만료 시간
+Transition 업데이트가 5초 동안 처리되지 못하고 계속 밀리면, 해당 Lane은 `expiredLanes`로 이동합니다. 만료된 Lane은 다음 번 렌더 결정 시 강제로 선택되며, time-slicing 없이 동기적으로 즉시 완료됩니다. 더 이상 밀릴 수 없습니다.
 
-```javascript
-// ReactFiberLane.js
-function computeExpirationTime(lane, currentTime) {
-  switch (lane) {
-    case SyncHydrationLane:
-    case SyncLane:
-    case InputContinuousHydrationLane:
-    case InputContinuousLane:
-      // 동기 계열: 0ms (현재 즉시 만료 상태)
-      return currentTime + 0;
-
-    case DefaultHydrationLane:
-    case DefaultLane:
-    case TransitionHydrationLane:
-    case TransitionLane1:
-    case TransitionLane2:
-    // ... TransitionLane16까지:
-      // Transition/Default: 5초 후 만료
-      return currentTime + 5000;
-
-    case RetryLane1:
-    // ... RetryLane5까지:
-      return NoTimestamp; // Retry: 만료 없음 (Suspense가 별도 관리)
-
-    case SelectiveHydrationLane:
-    case IdleHydrationLane:
-    case IdleLane:
-    case OffscreenLane:
-      return NoTimestamp; // Idle: 만료 없음
-  }
-}
-```
-
-### markStarvedLanesAsExpired — 전체 구현
-
-```javascript
-// ReactFiberLane.js
-function markStarvedLanesAsExpired(root, currentTime) {
-  var pendingLanes = root.pendingLanes;
-  var suspendedLanes = root.suspendedLanes;
-  var pingedLanes = root.pingedLanes;
-  var expirationTimes = root.expirationTimes;
-
-  var lanes = pendingLanes;
-
-  while (lanes > 0) {
-    var index = pickArbitraryLaneIndex(lanes);
-    var lane = 1 << index;
-    var expirationTime = expirationTimes[index];
-
-    if (expirationTime === NoTimestamp) {
-      // 만료 시간이 아직 설정되지 않은 경우
-      // 조건: Suspended 상태가 아니거나, Pinged된 경우
-      if (
-        (lane & suspendedLanes) === NoLanes ||
-        (lane & pingedLanes) !== NoLanes
-      ) {
-        // 지금부터 카운트다운 시작
-        expirationTimes[index] = computeExpirationTime(lane, currentTime);
-      }
-      // 주의: Suspended 상태에서는 타이머를 시작하지 않음
-      // 데이터가 없는 상태에서 강제 처리해봤자 의미없으므로
-    } else if (expirationTime <= currentTime) {
-      // 만료 초과! expiredLanes에 추가
-      root.expiredLanes |= lane;
-    }
-
-    lanes &= ~lane;
-  }
-}
-```
-
-### 만료 처리 타임라인
-
-```
-t=0ms:    startTransition(() => setList(bigData))
-          TransitionLane5 할당
-          pendingLanes |= TransitionLane5
-          expirationTimes[5] = NoTimestamp
-
-t=1ms:    고우선순위 click 이벤트 → SyncLane 처리
-          markStarvedLanesAsExpired(root, 1):
-            TransitionLane5: expirationTime = NoTimestamp
-            → suspended 아님 → 타이머 시작
-            expirationTimes[5] = 1 + 5000 = 5001ms
-
-t=500ms:  또 다른 SyncLane 업데이트
-          markStarvedLanesAsExpired(root, 500):
-            expirationTimes[5] = 5001 > 500 → 아직 살아있음
-
-t=5001ms: markStarvedLanesAsExpired(root, 5001):
-           expirationTimes[5] = 5001 <= 5001 → 만료!
-           root.expiredLanes |= TransitionLane5
-
-t=5002ms: getNextLanes() → expiredLanes 체크
-           → TransitionLane5 발견
-           performConcurrentWorkOnRoot에서:
-             includesExpiredLane → shouldTimeSlice = false
-           → renderRootSync 강제 (time-slicing 없이 즉시 완료)
-```
-
-### Suspended 상태의 타이머 중지
-
-```javascript
-// markRootSuspended: Suspense throw 시 호출
-function markRootSuspended(root, suspendedLanes) {
-  root.suspendedLanes |= suspendedLanes;
-  root.expiredLanes &= ~suspendedLanes;
-
-  // 만료 타이머 초기화 (데이터 없이 강제 처리 불가)
-  var expirationTimes = root.expirationTimes;
-  var lanes = suspendedLanes;
-  while (lanes > 0) {
-    var index = pickArbitraryLaneIndex(lanes);
-    var lane = 1 << index;
-    expirationTimes[index] = NoTimestamp; // 타이머 중지
-    lanes &= ~lane;
-  }
-}
-
-// markRootPinged: Promise resolve 시 호출
-function markRootPinged(root, pingedLanes) {
-  // suspendedLanes 중 pinged된 것만 pingedLanes로 이동
-  root.pingedLanes |= root.suspendedLanes & pingedLanes;
-  // → 이후 markStarvedLanesAsExpired에서 타이머 재시작
-}
-```
+주목할 부분은 Suspense로 인해 블로킹된 Lane은 타이머가 멈춘다는 점입니다. 데이터가 아직 없어서 렌더를 진행할 수 없는 상태에서 만료 카운트다운을 진행하는 것은 의미가 없기 때문입니다. Promise가 resolve되어 핑을 받으면 그때부터 다시 카운트다운이 시작됩니다.
 
 ---
 
-## 10. Concurrent Mode 인터럽트 — prepareFreshStack
+## Concurrent Mode의 심장: 5ms마다 브라우저에 제어권을 돌려주기
 
-고우선순위 업데이트가 도착하면 진행 중인 낮은 우선순위 렌더를 중단하고, WIP 트리를 버리고 새로 시작합니다.
+React의 Concurrent Mode가 "부드러운 사용자 경험"을 약속할 수 있는 물리적 근거는 **시간 슬라이싱(time-slicing)**입니다. 무거운 렌더링 작업을 5ms짜리 조각으로 잘라서, 각 조각 사이에 브라우저가 화면을 그리고 사용자 입력을 처리할 기회를 줍니다.
 
-```javascript
-// ReactFiberWorkLoop.js
-function prepareFreshStack(root, lanes) {
-  root.finishedWork = null;
-  root.finishedLanes = NoLanes;
+60fps를 위해 브라우저는 약 16.67ms마다 한 번씩 화면을 그려야 합니다. React가 이 시간을 독점하면 화면이 버벅입니다. 5ms씩 작업하고 나머지 11ms를 브라우저에 양보하면, 브라우저는 매 프레임을 제때 그릴 수 있습니다.
 
-  // 현재 진행 중인 timeout 취소
-  var timeoutHandle = root.timeoutHandle;
-  if (timeoutHandle !== noTimeout) {
-    root.timeoutHandle = noTimeout;
-    cancelTimeout(timeoutHandle);
-  }
+5ms라는 숫자는 경험적 최적값입니다. 1ms는 너무 짧아서 스케줄링 오버헤드가 실제 작업 시간을 초과합니다. 16ms는 너무 길어서 브라우저가 렌더링 기회를 잃습니다. 5ms는 의미 있는 Fiber 작업량을 처리하면서도 브라우저에 충분한 시간을 남기는 실용적 타협점입니다.
 
-  // 이전 WIP 트리의 Context, Suspense 경계 정리
-  if (workInProgress !== null) {
-    var interruptedWork = workInProgress.return;
-    while (interruptedWork !== null) {
-      var current = interruptedWork.alternate;
-      // Context 스택, Suspense 카운터 등 정리
-      unwindInterruptedWork(current, interruptedWork, workInProgressRootRenderLanes);
-      interruptedWork = interruptedWork.return;
-    }
-  }
-
-  // WIP 루트를 새 root로 설정
-  workInProgressRoot = root;
-  var rootWorkInProgress = createWorkInProgress(root.current, null);
-  workInProgress = rootWorkInProgress;
-
-  // ══ 핵심: 새 render lanes 설정 ══
-  workInProgressRootRenderLanes = lanes;
-  workInProgressRootExitStatus = RootInProgress;
-  workInProgressRootInterleavedUpdatedLanes = NoLanes;
-  workInProgressRootPingedLanes = NoLanes;
-  workInProgressRootConcurrentErrors = null;
-
-  return rootWorkInProgress;
-}
-```
-
-### workInProgressRootInterleavedUpdatedLanes의 역할
-
-```javascript
-// 렌더 중 도착한 인터리브 업데이트 추적
-var workInProgressRootInterleavedUpdatedLanes = NoLanes;
-
-// 새 업데이트 도착 시 기록
-function scheduleUpdateOnFiber(root, fiber, lane) {
-  if (root === workInProgressRoot) {
-    // 현재 렌더 중인 root에 새 업데이트 도착
-    workInProgressRootInterleavedUpdatedLanes = mergeLanes(
-      workInProgressRootInterleavedUpdatedLanes,
-      lane
-    );
-
-    // 새 lane의 우선순위가 더 높으면 → prepareFreshStack으로 재시작
-  }
-}
-```
-
-### workLoopConcurrent — 인터럽트 가능한 렌더 루프
-
-```javascript
-function workLoopConcurrent() {
-  // shouldYield()가 true를 반환하면 즉시 루프 탈출
-  // → 더 높은 우선순위 작업이 실행될 기회
-  while (workInProgress !== null && !shouldYield()) {
-    performUnitOfWork(workInProgress);
-  }
-}
-
-// performConcurrentWorkOnRoot에서의 처리
-function performConcurrentWorkOnRoot(root, didTimeout) {
-  // 인터럽트 감지: 렌더 중 더 높은 우선순위 업데이트 도착 확인
-  if (
-    workInProgressRootRenderLanes !== getNextLanes(root, workInProgressRootRenderLanes)
-  ) {
-    // 우선순위 변경 → prepareFreshStack으로 처음부터 재시작
-    prepareFreshStack(root, getNextLanes(root, NoLanes));
-  }
-
-  var shouldTimeSlice =
-    !includesBlockingLane(root, lanes) &&
-    !includesExpiredLane(root, lanes) &&
-    !didTimeout;
-
-  var exitStatus = shouldTimeSlice
-    ? renderRootConcurrent(root, lanes)  // 중단 가능
-    : renderRootSync(root, lanes);        // 동기 완료 강제
-
-  if (exitStatus === RootInProgress) {
-    // shouldYield로 인해 중단됨 → continuation 반환
-    return performConcurrentWorkOnRoot.bind(null, root);
-  }
-
-  // 완료 처리...
-  return null;
-}
-```
+이 시간 제한을 구현하는 `shouldYieldToHost`는 단순합니다. `performance.now()`로 현재 시각을 측정해서 현재 배치가 시작된 이후 5ms가 지났으면 `true`를 반환합니다. 렌더 루프는 매 Fiber 작업 후 이 함수를 확인하고, `true`라면 즉시 루프를 탈출합니다. 탈출한 후에는 자신의 다음 실행 함수(continuation)를 반환하고, Scheduler가 이를 받아 다음 MessageChannel 메시지에서 재개합니다.
 
 ---
 
-## 11. startTransition 내부 구현
+## MessageChannel: setTimeout이 아닌 이유
 
-```javascript
-// react/src/ReactStartTransition.js
-function startTransition(scope, options) {
-  var prevTransition = ReactCurrentBatchConfig.transition;
+비동기 스케줄링을 구현할 때 가장 먼저 떠오르는 도구는 `setTimeout(fn, 0)`입니다. 그런데 React Scheduler는 이 대신 `MessageChannel`을 사용합니다.
 
-  // 핵심: 이 플래그가 null이 아닌 동안
-  // requestUpdateLane이 TransitionLane을 할당함
-  ReactCurrentBatchConfig.transition = {};
+이유는 브라우저 스펙에 있습니다. W3C 명세는 `setTimeout`이 5회 이상 중첩 호출되면 최소 4ms의 지연을 강제하도록 규정합니다. 5ms 슬라이스를 목표로 하는데 콜백 대기에만 4ms를 쓴다면, 실제 React 작업에는 1ms밖에 남지 않습니다.
 
-  var currentTransition = ReactCurrentBatchConfig.transition;
+`requestAnimationFrame`은 어떨까요? 이것은 브라우저의 페인트 사이클(~16.67ms)에 묶여 있습니다. 페인트와 무관한 계산 작업도 16ms마다 한 번씩만 실행할 수 있고, 백그라운드 탭에서는 실행이 중단되거나 크게 느려집니다.
 
-  try {
-    scope(); // 사용자 코드 실행
-             // 이 안에서 발생하는 모든 setState → TransitionLane
-  } finally {
-    // 플래그 복구
-    ReactCurrentBatchConfig.transition = prevTransition;
-  }
-}
+`MessageChannel`은 macrotask를 생성하지만 타이머 스로틀링이 없습니다. 이벤트 루프의 다음 사이클에서 즉시 실행되며, 지연이 0.1ms 수준입니다. 페인트와 독립적으로 실행되어 백그라운드 탭에서도 동작합니다. React는 `channel.port2.postMessage(null)` 한 줄로 다음 작업 배치를 예약하고, `channel.port1.onmessage`에 등록된 핸들러가 5ms 작업 루프를 수행합니다.
 
-// requestCurrentTransition(): 현재 Transition 컨텍스트 반환
-function requestCurrentTransition() {
-  return ReactCurrentBatchConfig.transition;
-}
-```
-
-### Transition 중첩 처리
-
-```javascript
-startTransition(() => {
-  // prevTransition = null
-  // ReactCurrentBatchConfig.transition = {} (객체 A)
-
-  startTransition(() => {
-    // prevTransition = 객체 A
-    // ReactCurrentBatchConfig.transition = {} (객체 B)
-
-    setState(inner); // TransitionLane 할당
-
-  }); // finally: ReactCurrentBatchConfig.transition = 객체 A (복구)
-
-  setState(outer); // 여전히 Transition! (객체 A가 활성)
-
-}); // finally: ReactCurrentBatchConfig.transition = null (완전 복구)
-```
-
-중첩 `startTransition`은 올바르게 동작합니다. 내부 finally가 외부 transition 객체를 복구하므로, 외부 블록 전체가 Transition으로 처리됩니다.
+이벤트 루프의 관점에서 보면, macrotask(MessageChannel) → microtask 소진(Promise.then) → 렌더링 기회(레이아웃, 페인트) → 다음 macrotask의 순서가 반복됩니다. React의 작업 배치는 macrotask 자리를 차지하므로, 매 배치 후 브라우저는 자연스럽게 렌더링 기회를 얻습니다.
 
 ---
 
-## 12. useTransition Hook — isPending의 이중 setState 트릭
+## Scheduler의 두 개의 Min-heap
 
-`useTransition`은 `startTransition`에 `isPending` 상태를 결합합니다. 내부 구현에 흥미로운 트릭이 있습니다.
+React와 별도 패키지로 분리된 `scheduler`는 두 개의 최소 힙(min-heap)으로 태스크를 관리합니다. 하나는 지금 즉시 실행 가능한 태스크를 담는 `taskQueue`이고, 다른 하나는 `delay` 옵션 때문에 아직 시작할 수 없는 태스크를 담는 `timerQueue`입니다.
 
-```javascript
-// ReactFiberHooks.js
+`taskQueue`의 정렬 기준은 만료 시간(expirationTime)이고, `timerQueue`의 정렬 기준은 시작 시간(startTime)입니다. `advanceTimers` 함수가 주기적으로 `timerQueue`를 확인하여 `startTime <= currentTime`이 된 태스크를 `taskQueue`로 이동시킵니다.
 
-// Mount 시
-function mountTransition() {
-  var _useState = mountState(false);    // isPending 상태 초기화
-  var isPending = _useState[0];
-  var setPending = _useState[1];
+우선순위별 만료 시간은 다음과 같습니다. ImmediatePriority는 -1ms 즉시 만료, UserBlockingPriority는 250ms, NormalPriority는 5000ms, IdlePriority는 사실상 무한(약 12일)입니다. ImmediatePriority의 음수 timeout은 의도적입니다. 태스크가 생성되는 순간 이미 만료 상태이므로, 시간 슬라이스를 무시하고 즉시 강제 실행됩니다.
 
-  // startTransition 함수 생성 (fiber 참조 없는 안정적 함수)
-  var start = startTransitionWithPending.bind(null, setPending);
-
-  var hook = mountWorkInProgressHook();
-  hook.memoizedState = start;
-
-  return [isPending, start];
-}
-
-// useTransition의 startTransition 구현
-function startTransitionWithPending(setPending, scope) {
-  // ① isPending = true를 SyncLane으로 즉시 처리
-  //    → 사용자가 로딩 중임을 즉시 인지
-  setPending(true);
-
-  var prevTransition = ReactCurrentBatchConfig.transition;
-  ReactCurrentBatchConfig.transition = {};
-
-  try {
-    // ② isPending = false를 TransitionLane으로 처리
-    //    → 콘텐츠 준비 완료 후에만 스피너 사라짐
-    setPending(false);
-
-    // ③ 실제 내용 업데이트도 TransitionLane
-    scope();
-  } finally {
-    ReactCurrentBatchConfig.transition = prevTransition;
-  }
-}
-```
-
-### isPending의 이중 setState 타임라인
-
-```
-t=0:   버튼 클릭 → startTransition 실행
-
-       setPending(true)   → SyncLane
-         (즉시 처리: isPending = true → 스피너 표시)
-
-       [Transition 컨텍스트 시작]
-       setPending(false)  → TransitionLane5
-       scope()            → TransitionLane5
-
-       [entangleTransitions 발생]
-       → setPending(false)의 lane과 scope()의 lane이 얽힘
-
-t=즉시: isPending = true 렌더 완료 (SyncLane)
-        사용자에게 로딩 스피너 즉시 표시
-
-t=?:   scope()의 내용 렌더 완료 (TransitionLane5)
-t=?+1: setPending(false) 처리 (entangled, 같은 배치)
-        → isPending = false → 스피너 사라짐, 새 콘텐츠 표시
-
-보장: 콘텐츠 준비 전에 스피너가 절대 사라지지 않음
-     (entanglement가 이 순서를 강제)
-```
+힙 구현은 배열 기반의 이진 힙입니다. `push`와 `pop` 연산이 O(log n)이고, 최솟값 조회가 O(1)입니다. 태스크 취소는 특이하게도 힙에서 제거하는 대신 `task.callback = null`로 표시하는 방식입니다. 실제 제거는 `pop` 시점에 자연스럽게 일어납니다. 이 덕분에 취소 연산이 O(1)로 처리됩니다.
 
 ---
 
-## 13. ensureRootIsScheduled — Lane과 Scheduler의 연결점
+## SyncLane은 Scheduler를 우회한다
 
-Lane 시스템과 Scheduler 패키지를 연결하는 핵심 함수입니다. 어떤 우선순위로 언제 렌더링을 시작할지 결정합니다.
+SyncLane 업데이트는 Scheduler의 MessageChannel 기반 비동기 흐름을 완전히 건너뜁니다. 대신 마이크로태스크(microtask)를 통해 처리됩니다.
 
-```javascript
-// ReactFiberWorkLoop.js
-function ensureRootIsScheduled(root, currentTime) {
-  // 만료 lane 체크
-  markStarvedLanesAsExpired(root, currentTime);
+이벤트 루프에서 마이크로태스크는 현재 실행 중인 JavaScript가 끝난 직후, 렌더링 기회 이전에 소진됩니다. SyncLane 업데이트를 마이크로태스크로 등록한다는 것은 "현재 이벤트 핸들러가 끝나는 즉시, 브라우저가 화면을 그리기 전에 반드시 처리한다"는 의미입니다.
 
-  // 다음 처리할 lane 결정
-  var nextLanes = getNextLanes(root, workInProgressRootRenderLanes);
+`flushSync`가 `performSyncWorkOnRoot`를 즉시 실행하는 것과 달리, 일반 SyncLane 업데이트는 `Promise.resolve().then(flushSyncCallbacks)` 형태로 등록됩니다. 이것은 같은 이벤트 핸들러 안에서 발생하는 여러 SyncLane 업데이트를 자동으로 배치(batch)처리하기 위한 선택입니다. 핸들러가 끝나고 나서 한 번에 모아 처리하는 것이 매번 즉시 처리하는 것보다 효율적입니다.
 
-  if (nextLanes === NoLanes) {
-    // 할 일 없음
-    root.callbackNode = null;
-    root.callbackPriority = NoLane;
-    return;
-  }
-
-  var newCallbackPriority = getHighestPriorityLane(nextLanes);
-  var existingCallbackPriority = root.callbackPriority;
-
-  // 이미 같은 우선순위로 스케줄되어 있으면 재사용
-  if (existingCallbackPriority === newCallbackPriority) {
-    return;
-  }
-
-  // 기존 콜백 취소 (우선순위 변경)
-  if (existingCallbackPriority !== NoLane) {
-    cancelCallback(root.callbackNode);
-  }
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // SyncLane: Scheduler 우회, 마이크로태스크 사용
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  if (newCallbackPriority === SyncLane) {
-    scheduleSyncCallback(performSyncWorkOnRoot.bind(null, root));
-    scheduleMicrotask(flushSyncCallbacks);
-    root.callbackNode = null;
-    root.callbackPriority = SyncLane;
-    return;
-  }
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // 그 외: Scheduler에 등록
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  var schedulerPriorityLevel = lanesToEventPriority(nextLanes);
-  var newCallbackNode = scheduleCallback(
-    schedulerPriorityLevel,
-    performConcurrentWorkOnRoot.bind(null, root)
-  );
-
-  root.callbackNode = newCallbackNode;
-  root.callbackPriority = newCallbackPriority;
-}
-```
-
-### Lane → Scheduler Priority 매핑
-
-```javascript
-function lanesToEventPriority(lanes) {
-  var lane = getHighestPriorityLane(lanes);
-
-  if (!isHigherEventPriority(DiscreteEventPriority, lane)) {
-    return DiscreteEventPriority;  // → ImmediateSchedulerPriority (1)
-  }
-  if (!isHigherEventPriority(ContinuousEventPriority, lane)) {
-    return ContinuousEventPriority; // → UserBlockingSchedulerPriority (2)
-  }
-  if (includesNonIdleWork(lane)) {
-    return DefaultEventPriority;   // → NormalSchedulerPriority (3)
-  }
-  return IdleEventPriority;        // → IdleSchedulerPriority (5)
-}
-```
-
-전체 매핑 테이블:
-
-```
-Lane                            EventPriority               Scheduler Priority  timeout
-────────────────────────────────────────────────────────────────────────────────────────
-SyncLane                     → (마이크로태스크 직접)         → N/A
-SyncHydrationLane            → DiscreteEventPriority      → Immediate (1)       -1ms
-InputContinuousHydrationLane → ContinuousEventPriority    → UserBlocking (2)    250ms
-InputContinuousLane          → ContinuousEventPriority    → UserBlocking (2)    250ms
-DefaultLane                  → DefaultEventPriority       → Normal (3)          5000ms
-TransitionLane1~16           → DefaultEventPriority       → Normal (3)          5000ms
-RetryLane1~5                 → DefaultEventPriority       → Normal (3)          5000ms
-IdleLane                     → IdleEventPriority          → Idle (5)            무한
-OffscreenLane                → IdleEventPriority          → Idle (5)            무한
-```
+React 18에서 `createRoot`를 사용하면 이벤트 핸들러 외부(`setTimeout`, `fetch` 콜백 등)에서도 자동 배치가 적용됩니다. 이 역시 같은 마이크로태스크 스케줄링 메커니즘 덕분입니다.
 
 ---
 
-## 14. Scheduler 내부 — 두 개의 Min-heap
+## Lane의 탄생과 소멸: 완전한 생명 주기
 
-`scheduler` 패키지는 React와 독립적인 우선순위 태스크 스케줄러입니다. 핵심은 **두 개의 Min-heap**입니다.
+하나의 Lane이 시스템 안에서 어떤 경로를 거치는지 처음부터 끝까지 따라가 봅시다.
 
-```javascript
-// Scheduler.js 전역 상태
-var taskQueue  = []; // 즉시 실행 가능한 태스크 (sortIndex = expirationTime)
-var timerQueue = []; // delay 때문에 아직 시작 못한 태스크 (sortIndex = startTime)
+`setState`가 호출되면 해당 Fiber에 Lane이 부여되고, `markRootUpdated`를 통해 `root.pendingLanes`에 비트가 켜집니다. 이와 동시에 조상 Fiber들의 `childLanes`도 업데이트됩니다.
 
-var taskIdCounter = 1;
-var currentTask = null;
-var currentPriorityLevel = NormalPriority;
+렌더링이 시작되면 이 Lane은 진행 중인 상태가 됩니다. 만약 Suspense 경계를 만나 Promise를 throw하면, `markRootSuspended`가 호출되어 해당 Lane이 `suspendedLanes`로 이동합니다. 만료 타이머도 멈춥니다. 데이터가 없는 상태에서 타이머를 돌리는 것은 의미가 없기 때문입니다.
 
-var isPerformingWork = false;
-var isHostCallbackScheduled = false;
-var isHostTimeoutScheduled = false;
-var needsPaint = false;
+Promise가 resolve되면 `markRootPinged`가 `pingedLanes`를 업데이트합니다. 다음 `getNextLanes`는 이 pinged Lane을 선택하여 렌더를 재시도합니다.
 
-var frameInterval = 5; // 5ms 시간 슬라이스
-var startTime = -1;    // 현재 작업 배치 시작 시각
-```
-
-### Min-heap 구현
-
-```javascript
-// 배열 기반 이진 힙 (인덱스 0이 루트)
-// 부모 인덱스: (i - 1) >>> 1
-// 왼쪽 자식:  2 * (i + 1) - 1
-// 오른쪽 자식: 2 * (i + 1)
-
-function push(heap, node) {
-  var index = heap.length;
-  heap.push(node);
-  // Sift-up: 부모보다 작으면 교환 (Min-heap 성질 유지)
-  a: for (; index > 0; ) {
-    var parentIndex = (index - 1) >>> 1; // 논리적 우측 시프트 = floor((i-1)/2)
-    var parent = heap[parentIndex];
-    if (0 < compare(parent, node)) {     // 부모 > 현재 → 교환
-      heap[parentIndex] = node;
-      heap[index] = parent;
-      index = parentIndex;
-    } else break a;
-  }
-}
-
-function pop(heap) {
-  if (heap.length === 0) return null;
-  var first = heap[0];      // 최솟값 저장
-  var last = heap.pop();    // 마지막 요소 추출
-  if (last !== first) {
-    heap[0] = last;         // 마지막을 루트로
-    // Sift-down: 자식보다 크면 교환
-    siftDown(heap, last, 0);
-  }
-  return first;
-}
-
-function compare(a, b) {
-  var diff = a.sortIndex - b.sortIndex;
-  return diff !== 0 ? diff : a.id - b.id; // 동점 시 ID로 결정 (FIFO)
-}
-```
-
-### 두 큐의 역할 분리
-
-```
-timerQueue                    taskQueue
-(sortIndex = startTime)       (sortIndex = expirationTime)
-┌─────────────────────┐       ┌─────────────────────────┐
-│ startTime: 2000ms   │       │ expTime: -1ms  ← Immediate 최우선
-│ startTime: 5000ms   │  ─→   │ expTime: 300ms
-│ startTime: 10000ms  │       │ expTime: 5200ms
-└─────────────────────┘       └─────────────────────────┘
-         ↑                               ↑
-  requestHostTimeout             MessageChannel 루프
-  (setTimeout으로 깨우기)         (5ms마다 실행)
-
-advanceTimers(): timerQueue에서 startTime <= currentTime인 태스크를
-                 taskQueue로 승격
-```
+렌더가 성공적으로 완료되면 `commitRoot`에서 `markRootFinished`가 호출됩니다. 완료된 Lane은 `pendingLanes`에서 제거되고, 관련 만료 타이머가 초기화되며, Entanglement 배열에서도 해당 Lane과의 연결이 모두 해제됩니다. Lane은 32비트 정수에서 비트가 꺼지는 것으로 소멸합니다.
 
 ---
 
-## 15. scheduleCallback — 작업 등록 전체 흐름
+## 전체 그림: 버튼 클릭부터 화면 갱신까지
 
-```javascript
-// Scheduler.js - unstable_scheduleCallback
-function unstable_scheduleCallback(priorityLevel, callback, options) {
-  var currentTime = unstable_now(); // performance.now()
+모든 개념을 하나의 흐름으로 연결해봅시다. 사용자가 버튼을 클릭해서 `setState`를 호출하는 가장 단순한 시나리오입니다.
 
-  // ① startTime 계산 (delay 옵션 처리)
-  var startTime;
-  if (typeof options === 'object' && options !== null) {
-    var delay = options.delay;
-    startTime = (typeof delay === 'number' && delay > 0)
-      ? currentTime + delay
-      : currentTime;
-  } else {
-    startTime = currentTime;
-  }
+클릭 이벤트 핸들러 안에서 `setState`가 호출됩니다. `requestUpdateLane`은 현재 이벤트가 `click`임을 감지하고 SyncLane을 배정합니다. 해당 Fiber의 UpdateQueue에 새 Update가 추가되고, `markUpdateLaneFromFiberToRoot`가 루트까지의 모든 조상 `childLanes`를 업데이트합니다.
 
-  // ② 우선순위별 timeout 계산
-  var timeout;
-  switch (priorityLevel) {
-    case ImmediatePriority:      timeout = -1;         break; // 즉시 만료
-    case UserBlockingPriority:   timeout = 250;        break;
-    case IdlePriority:           timeout = 1073741823; break; // 사실상 무한
-    case LowPriority:            timeout = 10000;      break;
-    default:                     timeout = 5000;              // NormalPriority
-  }
+`ensureRootIsScheduled`는 SyncLane임을 확인하고 Scheduler를 우회하여 `performSyncWorkOnRoot`를 마이크로태스크로 등록합니다. 이벤트 핸들러가 끝납니다.
 
-  // ③ 만료 시간 = 시작 시간 + timeout
-  var expirationTime = startTime + timeout;
+마이크로태스크 큐가 실행되면서 `flushSyncCallbacks`가 `performSyncWorkOnRoot`를 호출합니다. `renderRootSync`가 `workLoopSync`를 통해 Fiber 트리를 순회합니다. `childLanes`가 0인 서브트리는 통째로 건너뜁니다. 변경이 필요한 Fiber만 재렌더됩니다.
 
-  // ④ 태스크 객체 생성
-  var newTask = {
-    id:             taskIdCounter++,
-    callback:       callback,
-    priorityLevel:  priorityLevel,
-    startTime:      startTime,
-    expirationTime: expirationTime,
-    sortIndex:      -1
-  };
+렌더가 완료되면 `commitRoot`가 시작됩니다. DOM 변경이 일어나고, `useLayoutEffect`가 실행됩니다. `root.current`가 새 Fiber 트리로 교체됩니다. `markRootFinished`로 SyncLane이 `pendingLanes`에서 제거됩니다. `useEffect`는 별도 NormalPriority Scheduler 태스크로 예약됩니다.
 
-  // ⑤ 큐 배치 결정
-  if (startTime > currentTime) {
-    // delay가 있는 태스크 → timerQueue
-    newTask.sortIndex = startTime;
-    push(timerQueue, newTask);
+렌더링 기회에서 브라우저가 변경된 DOM을 화면에 반영합니다. 그 뒤 MessageChannel macrotask에서 `flushPassiveEffects`가 `useEffect`를 실행합니다.
 
-    // taskQueue가 비었고 이 태스크가 timerQueue 최소값이면
-    // setTimeout으로 깨우기 예약
-    if (peek(taskQueue) === null && newTask === peek(timerQueue)) {
-      if (isHostTimeoutScheduled) {
-        cancelHostTimeout();
-      }
-      isHostTimeoutScheduled = true;
-      requestHostTimeout(handleTimeout, startTime - currentTime);
-    }
-  } else {
-    // 즉시 실행 태스크 → taskQueue
-    newTask.sortIndex = expirationTime;
-    push(taskQueue, newTask);
-
-    // MessageChannel 루프 시작 (아직 안 실행 중이면)
-    if (!isHostCallbackScheduled && !isPerformingWork) {
-      isHostCallbackScheduled = true;
-      requestHostCallback();
-    }
-  }
-
-  return newTask;
-}
-```
-
-### ImmediatePriority의 음수 timeout 트릭
-
-```
-ImmediatePriority: timeout = -1
-
-currentTime = 1000ms
-startTime   = 1000ms (delay 없음)
-expirationTime = 1000 + (-1) = 999ms
-
-→ 태스크 생성 직후부터 999ms < 1000ms → 이미 만료!
-
-workLoop에서:
-  callback(expirationTime <= currentTime)
-           ↑ true → didTimeout = true
-
-→ ImmediatePriority 태스크는 생성 즉시 만료 상태로 실행
-  shouldYield()를 무시하고 강제 처리
-```
+`startTransition`을 사용하는 경우라면 흐름이 달라집니다. TransitionLane이 배정되고, `ensureRootIsScheduled`는 NormalPriority Scheduler 태스크로 등록합니다. 5ms마다 브라우저에 제어권을 돌려주면서 Fiber를 조금씩 처리하고, 중간에 더 높은 우선순위 업데이트가 들어오면 TransitionLane 렌더를 인터럽트합니다. 이 과정에서 `prepareFreshStack`이 WIP 트리를 버리고 새 우선순위로 처음부터 시작합니다.
 
 ---
 
-## 16. MessageChannel 기반 비동기 스케줄링
+## Lane 시스템이 달성한 것들
 
-브라우저 환경에서 Scheduler는 `setTimeout(fn, 0)` 대신 **MessageChannel**을 사용합니다.
+React의 Lane 시스템은 비트 연산이라는 저수준 도구를 활용해 매우 높은 수준의 사용자 경험 보장을 달성합니다.
 
-```javascript
-// Scheduler.js
-var channel = new MessageChannel();
-var port = channel.port2;
-channel.port1.onmessage = performWorkUntilDeadline;
+**O(1) 우선순위 결정**: `lanes & -lanes` 단 하나의 연산으로 가장 높은 우선순위 Lane을 추출합니다. 매 렌더 사이클마다 반복되는 이 연산에 분기가 없습니다.
 
-function schedulePerformWorkUntilDeadline() {
-  port.postMessage(null); // 이것이 전부
-}
+**선택적 렌더링**: `childLanes`를 통해 변경이 없는 서브트리 전체를 O(1)로 건너뜁니다. 트리가 아무리 커도 변경된 Fiber만 찾아갑니다.
 
-// Node.js 환경에서는 setImmediate 사용
-// 폴백으로 setTimeout
-```
+**중간 상태 방지**: Entanglement가 관련 업데이트들의 커밋을 원자적으로 묶습니다. 절반만 업데이트된 UI가 사용자에게 노출되지 않습니다.
 
-### MessageChannel을 선택한 이유
+**기아 방지**: 만료 시스템이 낮은 우선순위 작업도 최대 5초 안에 반드시 처리되도록 강제합니다.
 
-```
-setTimeout(fn, 0)의 문제:
-  - W3C 스펙: 중첩 호출 5회 이상 시 최소 4ms 강제 지연
-  - 실제 측정: 4~8ms 지연 발생
-  - 5ms 슬라이스 계획 중 4ms를 콜백 대기로 소모
-  - 결과: 실제 React 작업에 1ms만 남음
+**부드러운 인터랙션**: 5ms 시간 슬라이싱과 continuation 패턴으로 무거운 렌더링 중에도 사용자 입력에 즉각 반응합니다.
 
-requestAnimationFrame의 문제:
-  - 브라우저 페인트 사이클(~16.67ms)에 묶임
-  - 페인트와 무관한 작업도 16ms마다만 실행 가능
-  - 백그라운드 탭에서 실행 안 됨 또는 매우 느림
-
-MessageChannel의 장점:
-  - macrotask이지만 타이머 스로틀링 없음
-  - 지연: ~0.1ms (이벤트 루프의 다음 macrotask)
-  - 5ms 슬라이스를 온전히 React 작업에 활용
-  - 페인트와 독립적으로 실행
-```
-
-### 이벤트 루프에서의 위치
-
-```
-이벤트 루프 한 사이클:
-┌──────────────────────────────────────────────────────────┐
-│  1. macrotask 하나 실행                                    │
-│     (MessageChannel onmessage = performWorkUntilDeadline) │
-│     → 최대 5ms 동안 React Fiber 처리                       │
-│                                                          │
-│  2. microtask 큐 소진                                     │
-│     (Promise.then, queueMicrotask)                        │
-│                                                          │
-│  3. 렌더링 기회                                           │
-│     (스타일 재계산, 레이아웃, 페인트)                        │
-│                                                          │
-│  4. 다음 macrotask                                        │
-│     (다음 MessageChannel 메시지 = 다음 React 배치)          │
-└──────────────────────────────────────────────────────────┘
-
-결과:
-  - React 작업과 브라우저 렌더링이 교대로 실행
-  - 각 React 배치는 5ms를 초과하지 않음
-  - 브라우저가 매 배치 후 렌더링 기회를 얻음
-  - 60fps 달성 가능 (16.67ms 프레임 예산 내에 렌더 완료)
-```
-
----
-
-## 17. performWorkUntilDeadline — 작업 루프의 심장
-
-```javascript
-// Scheduler.js
-function performWorkUntilDeadline() {
-  needsPaint = false;
-
-  if (isMessageLoopRunning) {
-    var currentTime = unstable_now();
-    startTime = currentTime; // shouldYieldToHost 기준점 갱신
-
-    var hasMoreWork = true;
-    try {
-      a: {
-        isHostCallbackScheduled = false;
-
-        // 예약된 timeout 취소 (지금 직접 처리할 것이므로)
-        if (isHostTimeoutScheduled) {
-          isHostTimeoutScheduled = false;
-          cancelHostTimeout();
-        }
-
-        isPerformingWork = true;
-        var previousPriorityLevel = currentPriorityLevel;
-
-        try {
-          b: {
-            // 배치 시작 시 timerQueue → taskQueue 승격 확인
-            advanceTimers(currentTime);
-
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            // 핵심 workLoop
-            // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            for (
-              currentTask = peek(taskQueue);
-              currentTask !== null &&
-              !(
-                currentTask.expirationTime > currentTime && // 아직 만료 안 됨
-                shouldYieldToHost()                         // AND 5ms 초과
-              );
-            ) {
-              var callback = currentTask.callback;
-
-              if (typeof callback === 'function') {
-                currentTask.callback = null;
-                currentPriorityLevel = currentTask.priorityLevel;
-
-                // didTimeout: expirationTime <= currentTime
-                var continuationCallback = callback(
-                  currentTask.expirationTime <= currentTime
-                );
-
-                currentTime = unstable_now();
-
-                if (typeof continuationCallback === 'function') {
-                  // 작업 미완료 → continuation으로 재시작
-                  currentTask.callback = continuationCallback;
-                  advanceTimers(currentTime);
-                  hasMoreWork = true;
-                  break b;
-                }
-
-                // 완료: taskQueue에서 제거
-                if (currentTask === peek(taskQueue)) {
-                  pop(taskQueue);
-                }
-                advanceTimers(currentTime);
-              } else {
-                // callback === null → 취소된 태스크
-                pop(taskQueue);
-              }
-
-              currentTask = peek(taskQueue);
-            }
-
-            // 루프 종료 판단
-            if (currentTask !== null) {
-              hasMoreWork = true;  // shouldYield로 중단 → 더 있음
-            } else {
-              // taskQueue 비었음 → timerQueue 확인 후 timeout 예약
-              var firstTimer = peek(timerQueue);
-              if (firstTimer !== null) {
-                requestHostTimeout(handleTimeout, firstTimer.startTime - currentTime);
-              }
-              hasMoreWork = false;
-            }
-          }
-          break a;
-        } finally {
-          currentTask = null;
-          currentPriorityLevel = previousPriorityLevel;
-          isPerformingWork = false;
-        }
-      }
-    } finally {
-      if (hasMoreWork) {
-        schedulePerformWorkUntilDeadline(); // 다음 MessageChannel 예약
-      } else {
-        isMessageLoopRunning = false; // 루프 종료
-      }
-    }
-  }
-}
-```
-
-### 중단 조건의 논리 분석
-
-```javascript
-!(
-  currentTask.expirationTime > currentTime && // 조건 A: 아직 만료 안 됨
-  shouldYieldToHost()                          // 조건 B: 5ms 초과
-)
-```
-
-드모르간의 법칙: `!(A && B)` = `!A || !B`
-
-- `!A`: `expirationTime <= currentTime` → 만료됨 → **절대 양보하지 않고 즉시 실행**
-- `!B`: `shouldYieldToHost() === false` → 아직 5ms 이내 → **계속 실행**
-
-즉: **만료된 태스크는 시간 슬라이스를 무시하고 강제 실행됩니다.** ImmediatePriority 태스크가 생성 즉시 만료 상태인 이유입니다.
-
----
-
-## 18. shouldYieldToHost — 5ms 시간 슬라이싱
-
-```javascript
-// Scheduler.js
-function shouldYieldToHost() {
-  return needsPaint
-    ? true  // 페인트 긴급 → 즉시 양보
-    : (unstable_now() - startTime) < frameInterval
-      ? false  // 5ms 이내 → 계속 실행
-      : true;  // 5ms 초과 → 양보
-}
-```
-
-### 5ms 선택의 근거
-
-```
-60fps 프레임 예산: 16.67ms
-
-너무 긴 슬라이스 (예: 16ms):
-  - 브라우저 렌더링 시간 0ms → 프레임 드롭 → 버벅임
-
-너무 짧은 슬라이스 (예: 1ms):
-  - MessageChannel 전환 비용 > 실제 작업 시간
-  - 스케줄링 오버헤드가 지배적
-
-5ms 선택:
-  - 브라우저에 11.67ms 이상 남김 (렌더링 여유)
-  - 의미 있는 Fiber 작업량을 한 슬라이스에 처리
-  - MessageChannel 전환 비용 최소화
-
-120fps 디스플레이 지원:
-  unstable_forceFrameRate(120) → frameInterval = Math.floor(1000/120) = 8ms
-```
-
-`needsPaint` 플래그는 `requestPaint()`로 설정됩니다:
-
-```javascript
-// commitRootImpl에서 DOM 변경 직후 호출
-function requestPaint() {
-  if (
-    enableIsInputPending &&
-    navigator !== undefined &&
-    navigator.scheduling !== undefined &&
-    navigator.scheduling.isInputPending !== undefined
-  ) {
-    needsPaint = true; // 브라우저에 페인트 기회 양보 신호
-  }
-}
-```
-
----
-
-## 19. continuationCallback — 중단과 재개
-
-Scheduler의 작업 중단/재개 메커니즘은 `continuationCallback` 패턴으로 구현됩니다.
-
-```javascript
-// Scheduler workLoop 내부
-var continuationCallback = callback(didTimeout);
-
-if (typeof continuationCallback === 'function') {
-  // 작업이 완료되지 않고 "나중에 계속 실행할 함수"를 반환
-  currentTask.callback = continuationCallback;
-  // 태스크 객체를 재사용 (새 태스크 생성 없음)
-  // → Min-heap 연산 비용 없음
-  hasMoreWork = true;
-  break b; // 현재 배치 종료, 다음 MessageChannel에서 재개
-}
-```
-
-React Reconciler가 이 패턴을 활용하는 방식:
-
-```javascript
-// performConcurrentWorkOnRoot
-function performConcurrentWorkOnRoot(root, didTimeout) {
-  // ... 렌더링 실행 ...
-
-  if (exitStatus === RootInProgress) {
-    // workLoopConcurrent가 shouldYield()로 중단됨
-    // → 자기 자신을 continuation으로 반환
-    return performConcurrentWorkOnRoot.bind(null, root);
-    //     ↑ 이것이 다음 배치에서 실행될 함수
-  }
-
-  // 렌더 완료
-  return null;
-}
-```
-
-### 중단/재개 타임라인
-
-```
-t=0ms:    scheduleCallback(NormalPriority, performConcurrentWorkOnRoot)
-          taskQueue: [task(expTime=5000ms, callback=performConcurrent...)]
-          port.postMessage() → MessageChannel 예약
-
-t=0ms:    performWorkUntilDeadline 실행 시작
-          startTime = 0ms
-
-  → performConcurrentWorkOnRoot(root, false) 실행
-    → workLoopConcurrent 실행 (Fiber A, B, C, D 처리...)
-
-  t=5ms:  shouldYieldToHost() = true → workLoopConcurrent 중단
-          workInProgress !== null (아직 Fiber 남음)
-          → return performConcurrentWorkOnRoot.bind(null, root) ← continuation!
-
-          Scheduler: continuationCallback 감지
-          → task.callback = continuation (태스크 유지, 콜백만 교체)
-          → hasMoreWork = true
-          → schedulePerformWorkUntilDeadline()
-
-t=5ms:    브라우저 렌더링 기회 (레이아웃, 페인트)
-
-t=5+εms:  performWorkUntilDeadline 재실행
-          → continuationCallback = performConcurrentWorkOnRoot 재실행
-          → workLoopConcurrent 재개 (Fiber E, F, G 처리...)
-
-...반복...
-
-t=완료:   performConcurrentWorkOnRoot → return null
-          Scheduler: null → 태스크 완료, taskQueue에서 제거
-```
-
----
-
-## 20. SyncLane 특별 처리 — scheduleMicrotask
-
-SyncLane 업데이트는 Scheduler를 **완전히 우회**합니다.
-
-```javascript
-// ensureRootIsScheduled에서
-if (newCallbackPriority === SyncLane) {
-  scheduleSyncCallback(performSyncWorkOnRoot.bind(null, root));
-  scheduleMicrotask(flushSyncCallbacks);
-  return;
-}
-
-// scheduleMicrotask: queueMicrotask 또는 Promise.resolve().then()
-function scheduleMicrotask(callback) {
-  if (
-    typeof queueMicrotask === 'function' &&
-    typeof Promise !== 'undefined'
-  ) {
-    Promise.resolve(null).then(callback).catch(handleError);
-  } else if (typeof queueMicrotask === 'function') {
-    queueMicrotask(callback);
-  } else {
-    // 폴백
-    scheduleCallback(ImmediatePriority, callback);
-  }
-}
-```
-
-### 왜 마이크로태스크인가?
-
-```
-이벤트 루프 우선순위:
-  1. 현재 실행 중인 synchronous JavaScript
-  2. Microtask 큐 소진 (Promise.then, queueMicrotask)  ← SyncLane
-  3. 렌더링 기회 (스타일 재계산, 레이아웃, 페인트)
-  4. Macrotask 큐 (setTimeout, MessageChannel)         ← Concurrent Mode
-
-SyncLane → Microtask:
-  현재 이벤트 핸들러 완료 직후, 렌더링 전에 즉시 실행
-  "이 업데이트는 렌더링 전에 반드시 처리되어야 한다"
-
-Concurrent Mode → MessageChannel (Macrotask):
-  렌더링 이후에도 실행될 수 있음
-  "이 업데이트는 브라우저 일정에 맞춰 처리되어도 됨"
-```
-
-### performSyncWorkOnRoot vs performConcurrentWorkOnRoot
-
-| 구분 | `performSyncWorkOnRoot` | `performConcurrentWorkOnRoot` |
-|------|------------------------|-------------------------------|
-| 실행 방식 | 마이크로태스크 → 즉시 | Scheduler → 비동기 |
-| 레인 | SyncLane | SyncLane 외 모든 레인 |
-| 렌더 함수 | `renderRootSync` | `renderRootConcurrent` 또는 `renderRootSync` |
-| Time-slicing | 불가 | `shouldTimeSlice` 조건부 |
-| 인터럽트 | 불가 | 가능 |
-
-`performConcurrentWorkOnRoot`에서의 Time-slicing 결정:
-
-```javascript
-var shouldTimeSlice =
-  !includesBlockingLane(root, lanes) &&  // SyncLane/InputContinuous/Default 없어야
-  !includesExpiredLane(root, lanes) &&   // 만료된 lane 없어야
-  !didTimeout;                           // Scheduler timeout 없어야
-
-// includesBlockingLane: SyncLane들은 항상 동기 완료
-var SyncDefaultLanes =
-  InputContinuousHydrationLane | InputContinuousLane |
-  DefaultHydrationLane | DefaultLane;
-function includesBlockingLane(root, lanes) {
-  return (lanes & SyncDefaultLanes) !== NoLanes;
-}
-```
-
----
-
-## 21. Lane 생명주기 — markRootUpdated에서 markRootFinished까지
-
-각 lane은 `pendingLanes`에서 시작하여 다양한 상태 변화를 거칩니다.
-
-### markRootUpdated — Lane 등록
-
-```javascript
-// ReactFiberLane.js
-function markRootUpdated(root, updateLane, eventTime) {
-  root.pendingLanes |= updateLane;
-
-  // Idle이 아닌 새 업데이트 도착 시 suspended/pinged 초기화
-  if (updateLane !== IdleLane) {
-    root.suspendedLanes = NoLanes;
-    root.pingedLanes = NoLanes;
-  }
-
-  // 이벤트 발생 시각 기록 (기아 방지 타이머 계산에 사용)
-  var eventTimes = root.eventTimes;
-  var index = laneToIndex(updateLane);
-  eventTimes[index] = eventTime;
-}
-```
-
-### Lane 상태 전이 다이어그램
-
-```
-setState() 호출
-      │ markRootUpdated
-      ▼
-[pendingLanes] ─────────────────────────────────────►
-      │                                               │
-      │ 렌더 시작                                      │ 만료 초과
-      │                                               │ markStarvedLanesAsExpired
-      ▼                                               ▼
-  (렌더 진행)                                    [expiredLanes]
-      │                                               │
-      │ Suspense throw                                │ 강제 동기 처리
-      │ markRootSuspended                             │ (time-slicing 없음)
-      ▼                                               │
-[suspendedLanes]                                      │
-      │                                               │
-      │ Promise resolve                               │
-      │ markRootPinged                                │
-      ▼                                               │
-[pingedLanes]                                         │
-      │                                               │
-      │ 재시도 렌더                                    │
-      ▼                                               ▼
-  렌더 완료
-      │ markRootFinished
-      ▼
-pendingLanes에서 제거 (lane GC)
-```
-
-### markRootFinished — 완료 처리
-
-```javascript
-// ReactFiberLane.js
-function markRootFinished(root, remainingLanes) {
-  var noLongerPendingLanes = root.pendingLanes & ~remainingLanes;
-
-  // 완료된 lane들 제거
-  root.pendingLanes = remainingLanes;
-  root.suspendedLanes &= remainingLanes;
-  root.pingedLanes &= remainingLanes;
-  root.expiredLanes &= remainingLanes;
-  root.entangledLanes &= remainingLanes;
-
-  // 완료된 lane들의 메타데이터 초기화
-  var expirationTimes = root.expirationTimes;
-  var lanes = noLongerPendingLanes;
-  while (lanes > 0) {
-    var index = pickArbitraryLaneIndex(lanes);
-    var lane = 1 << index;
-    expirationTimes[index] = NoTimestamp; // 만료 타이머 리셋
-    lanes &= ~lane;
-  }
-
-  // entanglements 배열에서 완료된 lane 제거
-  var entanglements = root.entanglements;
-  lanes = root.entangledLanes;
-  while (lanes > 0) {
-    var index = pickArbitraryLaneIndex(lanes);
-    var lane = 1 << index;
-    entanglements[index] &= remainingLanes; // 완료된 lane과의 얽힘 해제
-    lanes &= ~lane;
-  }
-}
-```
-
----
-
-## 22. 전체 흐름 — setState에서 화면 갱신까지
-
-모든 구성 요소를 하나의 흐름으로 통합합니다.
-
-```
-사용자가 버튼 클릭 (click 이벤트)
-│
-▼
-dispatchSetState(fiber, queue, action)
-│ ├─ getHighestPriorityLane으로 현재 fiber.lanes 확인
-│ ├─ requestUpdateLane(fiber) → SyncLane (click 이벤트)
-│ ├─ Eager State 최적화: fiber.lanes === NoLanes면
-│ │   reducer(currentState, action)으로 미리 계산
-│ │   Object.is(eagerState, currentState)?  → 렌더 스킵
-│ └─ enqueueUpdate → UpdateQueue에 Update 추가
-│
-▼
-scheduleUpdateOnFiber(fiber, SyncLane, eventTime)
-│ └─ markUpdateLaneFromFiberToRoot(fiber, SyncLane)
-│       fiber.lanes |= SyncLane
-│       모든 조상 fiber.childLanes |= SyncLane
-│
-▼
-markRootUpdated(root, SyncLane, eventTime)
-│ root.pendingLanes |= SyncLane
-│
-▼
-ensureRootIsScheduled(root, currentTime)
-│ markStarvedLanesAsExpired(root, currentTime)  ← 기아 체크
-│ getNextLanes(root, ...) → SyncLane
-│ newCallbackPriority = SyncLane
-│
-│ ← SyncLane이므로 Scheduler 우회 →
-│ scheduleSyncCallback(performSyncWorkOnRoot)
-│ scheduleMicrotask(flushSyncCallbacks)
-│
-▼
-[이벤트 핸들러 완료]
-[Microtask 큐 실행]
-│
-▼
-flushSyncCallbacks() → performSyncWorkOnRoot(root)
-│ renderRootSync(root, SyncLane)
-│ └─ workLoopSync()
-│      while (workInProgress !== null) {
-│        performUnitOfWork(workInProgress)
-│          beginWork → (childLanes 체크, bailout 또는 렌더)
-│          completeWork → Fiber 처리 완료
-│      }
-│
-▼
-commitRoot(root, finishedWork, lanes)
-│ commitBeforeMutationEffects   ← getSnapshotBeforeUpdate
-│ commitMutationEffects         ← DOM 변경
-│   └─ useInsertionEffect cleanup
-│   └─ useInsertionEffect mount
-│   └─ useLayoutEffect cleanup
-│ [root.current = finishedWork]  ← 더블 버퍼 포인터 교체
-│ commitLayoutEffects
-│   └─ useLayoutEffect mount
-│ markRootFinished(root, remainingLanes)
-│ scheduleCallback(NormalPriority, flushPassiveEffects) ← useEffect 예약
-│
-▼
-[렌더링 기회: 브라우저 페인트]
-│
-▼
-[MessageChannel: performWorkUntilDeadline]
-└─ flushPassiveEffects()
-     commitPassiveUnmountEffects  ← useEffect cleanup (전체 트리)
-     commitPassiveMountEffects    ← useEffect mount (전체 트리)
-```
-
-### Concurrent Mode로 바꾸면
-
-```javascript
-// startTransition(() => setList(bigData)) 경우
-
-requestUpdateLane → claimNextTransitionLane() → TransitionLane5
-ensureRootIsScheduled → scheduleCallback(NormalPriority, performConcurrentWorkOnRoot)
-
-[MessageChannel macrotask]
-performWorkUntilDeadline:
-  performConcurrentWorkOnRoot(root, false)
-    shouldTimeSlice = true (blocking lane 없음, 만료 없음)
-    renderRootConcurrent:
-      workLoopConcurrent:
-        while (workInProgress !== null && !shouldYield()) {
-          performUnitOfWork(workInProgress)
-        }
-
-    t=5ms: shouldYield() = true → 루프 중단
-    exitStatus = RootInProgress
-    → return performConcurrentWorkOnRoot.bind(null, root) ← continuation!
-
-[브라우저 렌더링 기회]
-
-[다음 MessageChannel]
-  → continuation 실행 → workLoopConcurrent 재개
-  → 완료 시 return null → commitRoot
-```
-
----
-
-## 핵심 설계 원칙 정리
-
-| 원칙 | 구현 방식 | 효과 |
-|------|----------|------|
-| **비트 연산으로 O(1) 우선순위 결정** | `lanes & -lanes` | 분기 없는 최고 우선순위 추출 |
-| **childLanes로 서브트리 건너뛰기** | `markUpdateLaneFromFiberToRoot` | 변경 없는 하위 트리 전체 bailout |
-| **Entanglement로 중간 상태 방지** | `markRootEntangled`, 전이적 closure | 관련 업데이트 항상 함께 커밋 |
-| **만료 기반 기아 방지** | `computeExpirationTime` + `markStarvedLanesAsExpired` | Transition도 5초 후 강제 처리 |
-| **인터럽트 가능한 렌더** | `workLoopConcurrent` + `shouldYield()` | 5ms마다 브라우저에 제어권 반환 |
-| **continuation으로 O(1) 재개** | `task.callback = continuationCallback` | 새 Scheduler 태스크 생성 없이 중단/재개 |
-| **O(1) 취소** | `task.callback = null` | heap 재정렬 없이 즉시 취소 |
-| **두 큐 분리** | `taskQueue` + `timerQueue` | 즉시/지연 태스크 분리 관리 |
+이 모든 것이 32비트 정수 하나와 비트 연산의 조합으로 구현되어 있습니다. 추상적인 "동시성"이라는 개념이 실제로 비트 수준에서 어떻게 구현되는지를 보면, 좋은 시스템 설계란 올바른 추상화를 선택하는 일임을 다시 한번 실감하게 됩니다.
 
 ---
 
 ## 더 알아보기
 
-- **이전 편**: [Hooks 시스템](./react-architecture-03-hooks-system.md)
-- **다음 편**: [렌더링 사이클](./react-architecture-05-rendering-cycle.md)
+- **이전 편**: [Hooks 시스템](./react-architecture-03-hooks-system.md) — Fiber 위에서 연결 리스트로 상태를 관리하는 방식
+- **다음 편**: [렌더링 사이클](./react-architecture-05-rendering-cycle.md) — beginWork, completeWork, commitRoot 전체 흐름
 - **관련 소스**: `packages/react-reconciler/src/ReactFiberLane.js`, `packages/scheduler/src/forks/Scheduler.js`
 - **참고 자료**:
-  - [React 18 Lane Model Deep Dive](https://goidle.github.io/react/in-depth-react18-lane/)
+  - [React 18 Lane Model Deep Dive — goidle.github.io](https://goidle.github.io/react/in-depth-react18-lane/)
   - [What are Lanes in React source code? — jser.dev](https://jser.dev/react/2022/03/26/lanes-in-react)
   - [How React Scheduler works internally — jser.dev](https://jser.dev/react/2022/03/16/how-react-scheduler-works/)
-  - [Concurrent Rendering and Lane Prioritization in React 18](https://j1032w.github.io/blog/concurrent-rendering-and-update-priority-in-react18)
   - [New feature: startTransition — reactwg Discussion](https://github.com/reactwg/react-18/discussions/41)
-
----
-
-*작성일: 2026-02-20*
