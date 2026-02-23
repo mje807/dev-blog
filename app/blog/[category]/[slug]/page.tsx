@@ -1,6 +1,7 @@
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
 import { getPostContent, getAllSlugs, CATEGORIES } from '@/lib/posts';
+import BlogContent from '@/components/BlogContent';
 
 interface Props {
   params: Promise<{ category: string; slug: string }>;
@@ -78,10 +79,7 @@ export default async function PostPage({ params }: Props) {
       <hr className="mb-10" style={{ borderColor: 'var(--border)' }} />
 
       {/* Content */}
-      <div
-        className="prose"
-        dangerouslySetInnerHTML={{ __html: post.content || '' }}
-      />
+      <BlogContent html={post.content || ''} />
 
       {/* Footer nav */}
       <div className="mt-16 pt-8 border-t" style={{ borderColor: 'var(--border)' }}>
