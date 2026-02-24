@@ -1,83 +1,89 @@
-import Link from 'next/link';
-import { getAllPosts, CATEGORIES } from '@/lib/posts';
-import PostCard from '@/components/PostCard';
+'use client';
 
-export default function HomePage() {
-  const allPosts = getAllPosts();
-  const recent = allPosts.slice(0, 6);
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
 
-  const categoryStats = Object.entries(CATEGORIES).map(([key, meta]) => ({
-    key,
-    ...meta,
-    count: allPosts.filter(p => p.category === key).length,
-  })).filter(c => c.count > 0);
+type Mode = 'idle' | 'routing';
+
+export default function ConsoleLauncherPage() {
+  const router = useRouter();
+  const [input, setInput] = useState('');
+  const [mode, setMode] = useState<Mode>('idle');
+  const [logs, setLogs] = useState<string[]>([
+    'console.log launcher initialized.',
+    'type: dev | invest | help',
+  ]);
+
+  const runCommand = (raw: string) => {
+    const cmd = raw.trim().toLowerCase();
+    const normalized = cmd
+      .replace('console.log(', '')
+      .replace(')', '')
+      .replace(/['"`]/g, '')
+      .trim();
+
+    setLogs((prev) => [...prev, `> ${raw}`]);
+
+    if (!normalized) return;
+    if (normalized === 'help') {
+      setLogs((prev) => [...prev, 'available: dev | invest']);
+      return;
+    }
+
+    if (normalized === 'dev' || normalized === 'invest') {
+      setLogs((prev) => [...prev, `routing to console.log(${normalized}) ...`]);
+      setMode('routing');
+      setTimeout(() => router.push(`/${normalized}`), 420);
+      return;
+    }
+
+    setLogs((prev) => [...prev, `unknown command: ${raw}`]);
+  };
 
   return (
-    <div className="space-y-16">
-      {/* Hero */}
-      <section className="py-10 text-center">
-        <div className="text-5xl mb-5">⌨️</div>
-        <h1 className="text-4xl font-extrabold mb-4" style={{ color: 'var(--text)' }}>
-          종구리.dev
-        </h1>
-        <p className="text-lg max-w-xl mx-auto" style={{ color: 'var(--text-muted)' }}>
-          8년차 시니어 프론트엔드 개발자.<br />
-          React 심층 분석 · Micro Frontends · AI 활용 개발 이야기.
-        </p>
-        <div className="flex items-center justify-center gap-4 mt-6">
-          <Link
-            href="/blog"
-            className="px-5 py-2.5 rounded-lg text-sm font-medium transition-colors"
+    <div
+      className={`transition-all duration-500 ${mode === 'routing' ? 'opacity-0 -translate-y-2 scale-[0.99]' : 'opacity-100 translate-y-0 scale-100'}`}
+    >
+      <div className="mx-auto max-w-3xl rounded-2xl border p-6 md:p-8" style={{ borderColor: 'var(--border)', backgroundColor: '#0b0f17' }}>
+        <div className="mb-5">
+          <h1 className="text-2xl md:text-3xl font-extrabold" style={{ color: 'var(--text)' }}>console.log()</h1>
+          <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>종구리의 멀티 모드 런처 · dev / invest</p>
+        </div>
+
+        <div className="rounded-xl border p-4 h-[320px] overflow-auto text-sm font-mono" style={{ borderColor: 'var(--border)', backgroundColor: '#070b11', color: '#d1e3ff' }}>
+          {logs.map((line, idx) => (
+            <div key={`${line}-${idx}`} className="leading-6">{line}</div>
+          ))}
+        </div>
+
+        <form
+          className="mt-4 flex items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!input.trim()) return;
+            const raw = input;
+            setInput('');
+            runCommand(raw);
+          }}
+        >
+          <span className="text-sm font-mono" style={{ color: 'var(--accent)' }}>{'>'}</span>
+          <input
+            autoFocus
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="dev 또는 invest 입력"
+            className="flex-1 rounded-lg border px-3 py-2 text-sm font-mono outline-none"
+            style={{ borderColor: 'var(--border)', backgroundColor: '#0b111b', color: 'var(--text)' }}
+          />
+          <button
+            type="submit"
+            className="px-3 py-2 rounded-lg text-sm font-medium"
             style={{ backgroundColor: 'var(--accent)', color: '#0f1117' }}
           >
-            전체 포스트 →
-          </Link>
-          <a
-            href="https://github.com/mje807"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="px-5 py-2.5 rounded-lg text-sm font-medium border transition-colors"
-            style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}
-          >
-            GitHub ↗
-          </a>
-        </div>
-      </section>
-
-      {/* Categories */}
-      <section>
-        <h2 className="text-sm font-semibold uppercase tracking-wider mb-4" style={{ color: 'var(--text-muted)' }}>
-          카테고리
-        </h2>
-        <div className="flex flex-wrap gap-3">
-          {categoryStats.map(cat => (
-            <Link
-              key={cat.key}
-              href={`/blog/${cat.key}`}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition-all"
-              style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-card)', color: 'var(--text)' }}
-            >
-              <span className={`text-xs px-1.5 py-0.5 rounded-full ${cat.color}`}>{cat.count}</span>
-              {cat.label}
-            </Link>
-          ))}
-        </div>
-      </section>
-
-      {/* Recent posts */}
-      <section>
-        <div className="flex items-center justify-between mb-5">
-          <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>최근 포스트</h2>
-          <Link href="/blog" className="text-sm" style={{ color: 'var(--accent)' }}>
-            전체 보기 →
-          </Link>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {recent.map((post, i) => (
-            <PostCard key={post.slug} post={post} featured={i === 0} />
-          ))}
-        </div>
-      </section>
+            run
+          </button>
+        </form>
+      </div>
     </div>
   );
 }

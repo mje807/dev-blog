@@ -3,21 +3,21 @@ import './globals.css';
 import Link from 'next/link';
 
 export const metadata: Metadata = {
-  title: '종구리 Dev Blog',
-  description: '프론트엔드 아키텍처, React 심층 분석, AI 활용 개발 이야기',
+  title: 'console.log(dev) / console.log(invest)',
+  description: '개발과 투자 인사이트를 콘솔 UI로 탐색하는 지식 허브',
   openGraph: {
-    title: '종구리 Dev Blog',
-    description: '프론트엔드 아키텍처, React 심층 분석, AI 활용 개발 이야기',
+    title: 'console.log(dev) / console.log(invest)',
+    description: '개발과 투자 인사이트를 콘솔 UI로 탐색하는 지식 허브',
     locale: 'ko_KR',
     type: 'website',
   },
 };
 
 const navLinks = [
-  { href: '/', label: 'Home' },
+  { href: '/', label: 'Console' },
+  { href: '/dev', label: 'Dev' },
+  { href: '/invest', label: 'Invest' },
   { href: '/blog', label: 'All Posts' },
-  { href: '/blog/react', label: 'React' },
-  { href: '/blog/frontend-architecture', label: 'Architecture' },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
