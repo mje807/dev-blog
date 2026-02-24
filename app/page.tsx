@@ -31,7 +31,7 @@ export default function ConsoleLauncherPage() {
       setTarget(normalized);
       setLogs((prev) => [...prev, `routing to console.log(${normalized}) ...`]);
       setPhase('routing');
-      setTimeout(() => router.push(`/${normalized}`), 620);
+      setTimeout(() => router.push(`/${normalized}`), 760);
       return;
     }
 
@@ -87,15 +87,28 @@ export default function ConsoleLauncherPage() {
       </div>
 
       <div
-        className={`pointer-events-none absolute inset-0 rounded-2xl flex items-center justify-center transition-all duration-500 ${phase === 'routing' ? 'opacity-100' : 'opacity-0'}`}
-        style={{ background: target === 'invest' ? 'rgba(248,250,252,0.75)' : 'rgba(15,17,23,0.75)' }}
+        className={`pointer-events-none fixed inset-0 z-[999] flex items-center justify-center transition-all duration-300 ${phase === 'routing' ? 'opacity-100' : 'opacity-0'}`}
+        style={{ background: target === 'invest' ? 'rgba(248,250,252,0.96)' : 'rgba(2,6,23,0.96)' }}
       >
-        <div className="text-center">
-          <div className="text-sm font-mono mb-3" style={{ color: target === 'invest' ? '#0f172a' : '#e2e8f0' }}>
-            switching theme → {target ? `console.log(${target})` : ''}
+        <div className="w-[min(88vw,680px)] text-center px-6">
+          <div className="text-xl md:text-2xl font-bold font-mono mb-3" style={{ color: target === 'invest' ? '#0f172a' : '#e2e8f0' }}>
+            {target ? `console.log(${target})` : 'switching...'}
           </div>
-          <div className="w-56 h-1.5 rounded-full overflow-hidden" style={{ background: target === 'invest' ? '#cbd5e1' : '#334155' }}>
-            <div className={`h-full ${phase === 'routing' ? 'w-full' : 'w-0'} transition-all duration-500`} style={{ background: target === 'invest' ? '#2563eb' : '#63b3ed' }} />
+          <div className="text-sm font-mono mb-6" style={{ color: target === 'invest' ? '#334155' : '#94a3b8' }}>
+            theme transition in progress...
+          </div>
+
+          <div className="w-full h-3 rounded-full overflow-hidden" style={{ background: target === 'invest' ? '#cbd5e1' : '#334155' }}>
+            <div
+              className={`h-full transition-all ${phase === 'routing' ? 'w-full' : 'w-0'}`}
+              style={{
+                background: target === 'invest'
+                  ? 'linear-gradient(90deg, #2563eb, #60a5fa)'
+                  : 'linear-gradient(90deg, #38bdf8, #6366f1)',
+                transitionDuration: '620ms',
+                transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+              }}
+            />
           </div>
         </div>
       </div>
