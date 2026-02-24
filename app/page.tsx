@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 type Phase = 'idle' | 'routing';
@@ -14,6 +14,34 @@ export default function ConsoleLauncherPage() {
     'console.log launcher initialized.',
     'type: dev | invest | help',
   ]);
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    router.prefetch('/dev');
+    router.prefetch('/invest');
+  }, [router]);
+
+  useEffect(() => {
+    if (phase !== 'routing') {
+      setProgress(0);
+      return;
+    }
+
+    const started = performance.now();
+    const duration = 900;
+    let raf = 0;
+
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - started) / duration);
+      // easeOutCubic
+      const eased = 1 - Math.pow(1 - t, 3);
+      setProgress(eased * 100);
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [phase]);
 
   const runCommand = (raw: string) => {
     const cmd = raw.trim().toLowerCase();
@@ -31,7 +59,7 @@ export default function ConsoleLauncherPage() {
       setTarget(normalized);
       setLogs((prev) => [...prev, `routing to console.log(${normalized}) ...`]);
       setPhase('routing');
-      setTimeout(() => router.push(`/${normalized}`), 760);
+      setTimeout(() => router.push(`/${normalized}`), 980);
       return;
     }
 
@@ -100,13 +128,15 @@ export default function ConsoleLauncherPage() {
 
           <div className="w-full h-3 rounded-full overflow-hidden" style={{ background: target === 'invest' ? '#cbd5e1' : '#334155' }}>
             <div
-              className={`h-full transition-all ${phase === 'routing' ? 'w-full' : 'w-0'}`}
+              className="h-full"
               style={{
+                width: `${progress}%`,
                 background: target === 'invest'
                   ? 'linear-gradient(90deg, #2563eb, #60a5fa)'
                   : 'linear-gradient(90deg, #38bdf8, #6366f1)',
-                transitionDuration: '620ms',
-                transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+                boxShadow: target === 'invest'
+                  ? '0 0 18px rgba(37,99,235,0.45)'
+                  : '0 0 18px rgba(56,189,248,0.45)',
               }}
             />
           </div>
