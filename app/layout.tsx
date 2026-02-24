@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
-import Link from 'next/link';
 import ThemeController from '@/components/ThemeController';
+import SiteHeader from '@/components/SiteHeader';
 
 export const metadata: Metadata = {
   title: 'console.log(dev) / console.log(invest)',
@@ -14,40 +14,12 @@ export const metadata: Metadata = {
   },
 };
 
-const navLinks = [
-  { href: '/', label: 'Console' },
-  { href: '/dev', label: 'Dev' },
-  { href: '/invest', label: 'Invest' },
-  { href: '/blog', label: 'All Posts' },
-];
-
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ko">
       <body className="min-h-screen flex flex-col">
         <ThemeController />
-        {/* Header */}
-        <header className="sticky top-0 z-50 border-b backdrop-blur-md" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--header-bg)' }}>
-          <div className="max-w-4xl mx-auto px-6 h-14 flex items-center justify-between">
-            <Link href="/" className="flex items-center gap-2 font-bold text-lg" style={{ color: 'var(--accent)' }}>
-              <span>⌨️</span>
-              <span>console.log(dev) · console.log(invest)</span>
-            </Link>
-            <nav className="flex items-center gap-6">
-              {navLinks.map(link => (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className="text-sm transition-colors"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  {link.label}
-                </Link>
-              ))}
-            </nav>
-          </div>
-        </header>
-
+        <SiteHeader />
         {/* Main */}
         <main className="flex-1 max-w-4xl mx-auto w-full px-6 py-10">
           {children}
