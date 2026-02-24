@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import Link from 'next/link';
+import ThemeController from '@/components/ThemeController';
 
 export const metadata: Metadata = {
   title: 'console.log(dev) / console.log(invest)',
@@ -24,12 +25,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="ko">
       <body className="min-h-screen flex flex-col">
+        <ThemeController />
         {/* Header */}
-        <header className="sticky top-0 z-50 border-b backdrop-blur-md" style={{ borderColor: 'var(--border)', backgroundColor: 'rgba(15,17,23,0.85)' }}>
+        <header className="sticky top-0 z-50 border-b backdrop-blur-md" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--header-bg)' }}>
           <div className="max-w-4xl mx-auto px-6 h-14 flex items-center justify-between">
             <Link href="/" className="flex items-center gap-2 font-bold text-lg" style={{ color: 'var(--accent)' }}>
               <span>⌨️</span>
-              <span>종구리.dev</span>
+              <span>console.log(dev) · console.log(invest)</span>
             </Link>
             <nav className="flex items-center gap-6">
               {navLinks.map(link => (
@@ -53,7 +55,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
         {/* Footer */}
         <footer className="border-t py-8 text-center text-sm" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
-          <p>© 2025 종구리.dev · 8년차 시니어 프론트엔드 개발자의 기술 블로그</p>
+          <p>© 2025 console.log(dev) · console.log(invest)</p>
         </footer>
       </body>
     </html>
