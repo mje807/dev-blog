@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { getAllPosts, CATEGORIES } from '@/lib/posts';
-import PostCard from '@/components/PostCard';
+import BlogPostBrowser from '@/components/BlogPostBrowser';
 
 export const metadata = {
   title: '전체 포스트 | 종구리.dev',
@@ -41,12 +41,7 @@ export default function BlogPage() {
         })}
       </div>
 
-      {/* Posts grid */}
-      <div className="grid gap-4 sm:grid-cols-2">
-        {posts.map(post => (
-          <PostCard key={`${post.category}-${post.slug}`} post={post} />
-        ))}
-      </div>
+      <BlogPostBrowser posts={posts} />
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { getPostsByCategory, CATEGORIES } from '@/lib/posts';
-import PostCard from '@/components/PostCard';
+import BlogPostBrowser from '@/components/BlogPostBrowser';
 
 interface Props {
   params: Promise<{ category: string }>;
@@ -42,11 +42,7 @@ export default async function CategoryPage({ params }: Props) {
       {posts.length === 0 ? (
         <p style={{ color: 'var(--text-muted)' }}>아직 작성된 글이 없습니다.</p>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2">
-          {posts.map(post => (
-            <PostCard key={post.slug} post={post} />
-          ))}
-        </div>
+        <BlogPostBrowser posts={posts} />
       )}
     </div>
   );
