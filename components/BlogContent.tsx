@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface BlogContentProps {
   html: string;
@@ -16,10 +16,14 @@ export default function BlogContent({ html }: BlogContentProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<'deep' | 'quick'>('deep');
 
-  const quickView = useMemo<QuickView>(() => {
-    if (!html) return { intro: '', sections: [], bullets: [] };
+  const [quickView, setQuickView] = useState<QuickView>({ intro: '', sections: [], bullets: [] });
 
-    // 브라우저에서만 동작 (client component)
+  useEffect(() => {
+    if (!html || typeof document === 'undefined') {
+      setQuickView({ intro: '', sections: [], bullets: [] });
+      return;
+    }
+
     const el = document.createElement('div');
     el.innerHTML = html;
 
@@ -34,11 +38,11 @@ export default function BlogContent({ html }: BlogContentProps) {
       .filter(Boolean)
       .slice(0, 5);
 
-    return {
+    setQuickView({
       intro: firstParagraph,
       sections: sectionTitles,
       bullets,
-    };
+    });
   }, [html]);
 
   useEffect(() => {
