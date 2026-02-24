@@ -76,7 +76,7 @@ export default function ConsoleLauncherPage() {
         <div className="mx-auto max-w-3xl rounded-2xl border p-6 md:p-8" style={{ borderColor: 'var(--border)', backgroundColor: '#0b0f17' }}>
           <div className="mb-5">
             <h1 className="text-2xl md:text-3xl font-extrabold" style={{ color: 'var(--text)' }}>console.log()</h1>
-            <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>종구리의 멀티 모드 런처 · dev / invest</p>
+            <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>멀티 모드 런처 · dev / invest</p>
           </div>
 
           <div className="rounded-xl border p-4 h-[320px] overflow-auto text-sm font-mono" style={{ borderColor: 'var(--border)', backgroundColor: '#070b11', color: '#d1e3ff' }}>
