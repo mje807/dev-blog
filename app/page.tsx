@@ -57,6 +57,8 @@ export default function ConsoleLauncherPage() {
 
     if (normalized === 'dev' || normalized === 'invest') {
       setTarget(normalized);
+      // 라우팅 전에 테마를 먼저 맞춰서(오버레이 구간) 페이지 전환 시 중복 테마 페이드 방지
+      document.documentElement.setAttribute('data-theme', normalized === 'invest' ? 'light' : 'dark');
       setLogs((prev) => [...prev, `routing to console.log(${normalized}) ...`]);
       setPhase('routing');
       setTimeout(() => router.push(`/${normalized}`), 980);
