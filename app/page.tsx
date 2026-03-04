@@ -23,7 +23,6 @@ export default function ConsoleLauncherPage() {
 
   useEffect(() => {
     if (phase !== 'routing') {
-      setProgress(0);
       return;
     }
 
