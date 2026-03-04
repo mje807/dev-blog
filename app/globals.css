@@ -123,6 +123,16 @@ header, footer, main, section, article, div, button, a, input, select {
   transition: background-color 420ms ease, color 420ms ease, border-color 420ms ease;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* 마크다운 스타일 */
 .prose {
   max-width: 72ch;

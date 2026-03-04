@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
+import useMotionPreset from '@/app/design/useMotionPreset';
 
 interface PostLike {
   slug: string;
@@ -33,6 +34,8 @@ export default function BlogPostBrowser({ posts }: { posts: PostLike[] }) {
   const [viewMode, setViewMode] = useState<ViewMode>('card');
   const [sortMode, setSortMode] = useState<SortMode>('latest');
 
+  const { style: motionStyle } = useMotionPreset('quick', 'background-color, border-color, color, opacity, transform');
+
   const sorted = useMemo(() => {
     const list = [...posts];
     list.sort((a, b) => {
@@ -54,14 +57,14 @@ export default function BlogPostBrowser({ posts }: { posts: PostLike[] }) {
           <button
             onClick={() => setViewMode('card')}
             className="px-3 py-1.5 text-sm"
-            style={{ background: viewMode === 'card' ? 'var(--accent)' : 'transparent', color: viewMode === 'card' ? '#0f1117' : 'var(--text-muted)' }}
+            style={{ ...motionStyle, background: viewMode === 'card' ? 'var(--accent)' : 'transparent', color: viewMode === 'card' ? '#0f1117' : 'var(--text-muted)' }}
           >
             카드형
           </button>
           <button
             onClick={() => setViewMode('list')}
             className="px-3 py-1.5 text-sm"
-            style={{ background: viewMode === 'list' ? 'var(--accent)' : 'transparent', color: viewMode === 'list' ? '#0f1117' : 'var(--text-muted)' }}
+            style={{ ...motionStyle, background: viewMode === 'list' ? 'var(--accent)' : 'transparent', color: viewMode === 'list' ? '#0f1117' : 'var(--text-muted)' }}
           >
             리스트형
           </button>
@@ -91,7 +94,7 @@ export default function BlogPostBrowser({ posts }: { posts: PostLike[] }) {
             const category = CATEGORIES[post.category];
             const readMins = estimateReadMinutes(`${post.title} ${post.excerpt}`);
             return (
-              <Link key={`${post.category}-${post.slug}`} href={href} className="block group rounded-xl border p-5" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-card)' }}>
+              <Link key={`${post.category}-${post.slug}`} href={href} className="block group rounded-xl border p-5" style={{ ...motionStyle, borderColor: 'var(--border)', backgroundColor: 'var(--bg-card)' }}>
                 <div className="flex items-center gap-2 mb-3">
                   <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${category?.color || 'bg-gray-100 text-gray-800'}`}>
                     {category?.label || post.category}
@@ -114,7 +117,7 @@ export default function BlogPostBrowser({ posts }: { posts: PostLike[] }) {
             const category = CATEGORIES[post.category];
             const readMins = estimateReadMinutes(`${post.title} ${post.excerpt}`);
             return (
-              <Link key={`${post.category}-${post.slug}`} href={href} className="block border-b last:border-b-0 px-4 py-3 hover:opacity-90" style={{ borderColor: 'var(--border)' }}>
+              <Link key={`${post.category}-${post.slug}`} href={href} className="block border-b last:border-b-0 px-4 py-3 hover:opacity-90" style={{ ...motionStyle, borderColor: 'var(--border)' }}>
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="font-semibold truncate" style={{ color: 'var(--text)' }}>{post.title}</div>
