@@ -1,6 +1,8 @@
 import Link from 'next/link';
 import { getAllPosts, CATEGORIES } from '@/lib/posts';
 import BlogPostBrowser from '@/components/BlogPostBrowser';
+import PageHeader from '@/components/ui/PageHeader';
+import SectionCard from '@/components/ui/SectionCard';
 
 export const metadata = {
   title: '전체 포스트 | 종구리.dev',
@@ -11,13 +13,11 @@ export default function BlogPage() {
 
   return (
     <div>
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold mb-2" style={{ color: 'var(--text)' }}>All Posts</h1>
-        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{posts.length}개의 글</p>
-      </div>
+      <PageHeader title="All Posts" subtitle={`${posts.length}개의 글`} />
 
       {/* Category filter */}
-      <div className="flex flex-wrap gap-2 mb-8">
+      <SectionCard className="mb-8">
+      <div className="flex flex-wrap gap-2">
         <Link
           href="/blog"
           className="px-3 py-1.5 rounded-lg text-sm border font-medium"
@@ -40,6 +40,7 @@ export default function BlogPage() {
           );
         })}
       </div>
+      </SectionCard>
 
       <BlogPostBrowser posts={posts} />
     </div>
