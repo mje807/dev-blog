@@ -42,7 +42,9 @@ export default function BlogPage() {
       </div>
       </SectionCard>
 
-      <BlogPostBrowser posts={posts} />
+      <SectionCard>
+        <BlogPostBrowser posts={posts} />
+      </SectionCard>
     </div>
   );
 }

@@ -39,7 +39,9 @@ export default async function CategoryPage({ params }: Props) {
       {posts.length === 0 ? (
         <p style={{ color: 'var(--text-muted)' }}>아직 작성된 글이 없습니다.</p>
       ) : (
-        <BlogPostBrowser posts={posts} />
+        <div className="rounded-xl border p-4" style={{ borderColor: 'var(--border)', backgroundColor: 'var(--bg-card)' }}>
+          <BlogPostBrowser posts={posts} />
+        </div>
       )}
     </div>
   );
