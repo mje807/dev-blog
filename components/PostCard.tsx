@@ -1,5 +1,6 @@
 import Link from 'next/link';
-import { Post, CATEGORIES } from '@/lib/posts';
+import type { Post } from '@/lib/posts';
+import { CATEGORIES } from '@/lib/content/categories';
 
 interface PostCardProps {
   post: Post;
