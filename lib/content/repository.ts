@@ -4,6 +4,7 @@ import matter from 'gray-matter';
 import { CATEGORIES, isCategoryKey, type CategoryKey } from '@/lib/content/categories';
 import type { RawPostFile } from '@/lib/content/schema';
 import { slugFromFilename } from '@/lib/content/transform';
+import { validateAndNormalizeFrontmatter } from '@/lib/content/validation';
 
 const contentDir = path.join(process.cwd(), 'content');
 
@@ -33,7 +34,7 @@ export function readPostFile(category: string, slug: string): RawPostFile | null
   return {
     slug,
     category,
-    frontmatter: data,
+    frontmatter: validateAndNormalizeFrontmatter(data),
     rawContent: content,
   };
 }
@@ -52,7 +53,7 @@ export function readAllPostFiles(): RawPostFile[] {
       posts.push({
         slug: slugFromFilename(file),
         category,
-        frontmatter: data,
+        frontmatter: validateAndNormalizeFrontmatter(data),
         rawContent: content,
       });
     }
