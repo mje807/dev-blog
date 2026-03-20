@@ -4,11 +4,14 @@ import ThemeController from '@/components/ThemeController';
 import SiteHeader from '@/components/SiteHeader';
 
 export const metadata: Metadata = {
-  title: 'console.log(dev) / console.log(invest)',
-  description: '개발과 투자 인사이트를 콘솔 UI로 탐색하는 지식 허브',
+  title: {
+    default: 'console.log(dev) | 종구리.dev',
+    template: '%s | 종구리.dev',
+  },
+  description: 'React, 프론트엔드 아키텍처, AI 활용 개발 인사이트를 쌓아가는 dev 중심 아카이브.',
   openGraph: {
-    title: 'console.log(dev) / console.log(invest)',
-    description: '개발과 투자 인사이트를 콘솔 UI로 탐색하는 지식 허브',
+    title: 'console.log(dev) | 종구리.dev',
+    description: 'React, 프론트엔드 아키텍처, AI 활용 개발 인사이트를 쌓아가는 dev 중심 아카이브.',
     locale: 'ko_KR',
     type: 'website',
   },
@@ -27,7 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
         {/* Footer */}
         <footer className="border-t py-8 text-center text-sm" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
-          <p>© 2025 console.log(dev) · console.log(invest)</p>
+          <p>© 2025 종구리.dev · console.log(dev) archive</p>
         </footer>
       </body>
     </html>

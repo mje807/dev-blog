@@ -1,5 +1,10 @@
 import Link from 'next/link';
 
+export const metadata = {
+  title: 'console.log(invest)',
+  description: '배당주, 거시지표, 포트폴리오 기록을 준비 중인 teaser surface.',
+};
+
 export default function InvestPage() {
   return (
     <div className="space-y-10">
@@ -9,7 +14,7 @@ export default function InvestPage() {
           console.log(invest)
         </h1>
         <p className="text-lg max-w-2xl mx-auto" style={{ color: 'var(--text-muted)' }}>
-          배당주/거시지표/포트폴리오 중심 투자 인사이트 허브
+          배당주/거시지표/포트폴리오 중심 투자 인사이트를 준비 중인 teaser surface
         </p>
       </section>
 
@@ -25,7 +30,7 @@ export default function InvestPage() {
             console.log(dev)
           </Link>
           <Link href="/blog" className="px-4 py-2 rounded-lg text-sm" style={{ backgroundColor: 'var(--accent)', color: '#0f1117' }}>
-            기존 블로그 보기
+            Dev Archive 보기
           </Link>
         </div>
       </section>
