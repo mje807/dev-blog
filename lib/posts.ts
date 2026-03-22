@@ -19,6 +19,9 @@ interface PostIndex {
 
 function sortPosts(posts: PostSummary[]): PostSummary[] {
   return [...posts].sort((a, b) => {
+    if (a.featured !== b.featured) {
+      return a.featured ? -1 : 1;
+    }
     if (a.date < b.date) return 1;
     if (a.date > b.date) return -1;
     return 0;

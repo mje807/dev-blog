@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getAllPosts, getCategoryCounts, CATEGORIES } from '@/lib/posts';
+import { getAllPosts, getCategoryCounts, getFeaturedPosts, CATEGORIES } from '@/lib/posts';
 import PostCard from '@/components/PostCard';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
@@ -12,8 +12,9 @@ export const metadata = {
 
 export default function DevPage() {
   const allPosts = getAllPosts();
+  const featuredPosts = getFeaturedPosts().slice(0, 3);
   const categoryCounts = getCategoryCounts();
-  const recent = allPosts.slice(0, 6);
+  const recent = allPosts.filter((post) => !post.featured).slice(0, 6);
 
   const categoryStats = Object.entries(CATEGORIES)
     .map(([key, meta]) => ({
@@ -49,6 +50,24 @@ export default function DevPage() {
         </div>
       </section>
 
+      {featuredPosts.length > 0 && (
+        <section>
+          <div className="flex items-center justify-between mb-5">
+            <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
+              Featured Posts
+            </h2>
+            <Link href="/blog" className="text-sm" style={{ color: 'var(--accent)' }}>
+              Dev Archive 전체 보기 →
+            </Link>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {featuredPosts.map((post, index) => (
+              <PostCard key={`${post.category}-${post.slug}`} post={post} featured={index === 0} />
+            ))}
+          </div>
+        </section>
+      )}
+
       <section>
         <SectionCard>
           <h2 className="text-sm font-semibold uppercase tracking-wider mb-4" style={{ color: 'var(--text-muted)' }}>
@@ -79,7 +98,7 @@ export default function DevPage() {
       <section>
         <div className="flex items-center justify-between mb-5">
           <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
-            최근 개발 포스트
+            Latest Posts
           </h2>
           <Link href="/blog" className="text-sm" style={{ color: 'var(--accent)' }}>
             Dev Archive 보기 →

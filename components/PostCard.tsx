@@ -33,10 +33,26 @@ export default function PostCard({ post, featured = false }: PostCardProps) {
   return (
     <Link href={href} className="block group">
       <article className="post-card rounded-xl border p-5 transition-all duration-200 h-full">
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex items-center gap-2 mb-3 flex-wrap">
           <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${category?.color || 'bg-gray-100 text-gray-800'}`}>
             {category?.label || post.category}
           </span>
+          {post.featured && (
+            <span
+              className="text-xs font-medium px-2 py-0.5 rounded-full border"
+              style={{ borderColor: 'var(--accent)', color: 'var(--accent)', backgroundColor: 'rgba(99,179,237,0.1)' }}
+            >
+              Featured
+            </span>
+          )}
+          {post.series && (
+            <span
+              className="text-xs font-medium px-2 py-0.5 rounded-full border"
+              style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+            >
+              Series
+            </span>
+          )}
           <span className="text-xs post-muted">
             {new Date(post.date).toLocaleDateString('ko-KR', {
               year: 'numeric',
