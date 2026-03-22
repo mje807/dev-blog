@@ -4,13 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "[1/3] TypeScript check"
+echo "[1/4] TypeScript check"
 npx tsc --noEmit
 
-echo "[2/3] ESLint check"
+echo "[2/4] Unit tests"
+npm run -s test
+
+echo "[3/4] ESLint check"
 npm run -s lint
 
-echo "[3/3] Production build"
+echo "[4/4] Production build"
 npm run -s build
 
 echo "✅ Quality gate passed"
