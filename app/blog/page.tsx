@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getAllPosts, CATEGORIES } from '@/lib/posts';
+import { getAllPosts, getCategoryCounts, CATEGORIES } from '@/lib/posts';
 import BlogPostBrowser from '@/components/BlogPostBrowser';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
@@ -12,6 +12,7 @@ export const metadata = {
 
 export default function BlogPage() {
   const posts = getAllPosts();
+  const categoryCounts = getCategoryCounts();
 
   return (
     <div>
@@ -33,7 +34,7 @@ export default function BlogPage() {
           전체
         </Link>
         {Object.entries(CATEGORIES).map(([key, meta]) => {
-          const count = posts.filter(p => p.category === key).length;
+          const count = categoryCounts[key] || 0;
           if (!count) return null;
           return (
             <Link

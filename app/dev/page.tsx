@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getAllPosts, CATEGORIES } from '@/lib/posts';
+import { getAllPosts, getCategoryCounts, CATEGORIES } from '@/lib/posts';
 import PostCard from '@/components/PostCard';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
@@ -12,13 +12,14 @@ export const metadata = {
 
 export default function DevPage() {
   const allPosts = getAllPosts();
+  const categoryCounts = getCategoryCounts();
   const recent = allPosts.slice(0, 6);
 
   const categoryStats = Object.entries(CATEGORIES)
     .map(([key, meta]) => ({
       key,
       ...meta,
-      count: allPosts.filter((p) => p.category === key).length,
+      count: categoryCounts[key] || 0,
     }))
     .filter((c) => c.count > 0);
 
