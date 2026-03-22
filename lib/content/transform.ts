@@ -54,6 +54,9 @@ export function normalizePostSummary(input: {
     date: frontmatter.date || FALLBACK_DATE,
     tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : [],
     excerpt: frontmatter.excerpt || excerptFromContent(rawContent),
+    draft: frontmatter.draft === true,
+    featured: frontmatter.featured === true,
+    series: frontmatter.series,
   };
 }
 

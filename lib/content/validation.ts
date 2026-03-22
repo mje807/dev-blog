@@ -35,5 +35,17 @@ export function validateAndNormalizeFrontmatter(input: unknown): PostFrontmatter
     normalized.excerpt = frontmatter.excerpt.trim();
   }
 
+  if (typeof frontmatter.draft === 'boolean') {
+    normalized.draft = frontmatter.draft;
+  }
+
+  if (typeof frontmatter.featured === 'boolean') {
+    normalized.featured = frontmatter.featured;
+  }
+
+  if (isNonEmptyString(frontmatter.series)) {
+    normalized.series = frontmatter.series.trim();
+  }
+
   return normalized;
 }

@@ -14,12 +14,18 @@ describe('frontmatter validation', () => {
         date: '2026-03-20',
         tags: [' react ', 'rsc', '', 123, null],
         excerpt: '  역할과 경계를 정리합니다.  ',
+        draft: true,
+        featured: true,
+        series: '  React Architecture Deep Dive  ',
       }),
     ).toEqual({
       title: 'React Server Components',
       date: '2026-03-20',
       tags: ['react', 'rsc'],
       excerpt: '역할과 경계를 정리합니다.',
+      draft: true,
+      featured: true,
+      series: 'React Architecture Deep Dive',
     });
   });
 

@@ -5,6 +5,9 @@ export interface PostFrontmatter {
   date?: string;
   tags?: string[];
   excerpt?: string;
+  draft?: boolean;
+  featured?: boolean;
+  series?: string;
 }
 
 export interface PostSummary {
@@ -14,6 +17,9 @@ export interface PostSummary {
   date: string;
   tags: string[];
   excerpt: string;
+  draft: boolean;
+  featured: boolean;
+  series?: string;
 }
 
 export interface PostDetail extends PostSummary {

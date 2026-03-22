@@ -42,6 +42,9 @@ describe('content transform utilities', () => {
     expect(summary.title).toBe('제목');
     expect(summary.date).toBe('2025-01-01');
     expect(summary.tags).toEqual([]);
+    expect(summary.draft).toBe(false);
+    expect(summary.featured).toBe(false);
+    expect(summary.series).toBeUndefined();
     expect(summary.excerpt).toContain('본문이 충분히 길어서 excerpt 자동 생성이 가능합니다.');
   });
 });

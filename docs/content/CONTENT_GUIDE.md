@@ -64,6 +64,9 @@ tags:
   - rsc
   - architecture
 excerpt: React Server Components가 어떤 문제를 풀고, 기존 loader/action 모델과 어떻게 역할을 나누는지 정리한다.
+draft: false
+featured: true
+series: React Architecture Deep Dive
 ---
 ```
 
@@ -80,6 +83,14 @@ excerpt: React Server Components가 어떤 문제를 풀고, 기존 loader/actio
 - `excerpt`
   - 1~2문장 권장
   - 없으면 본문 첫 문단 기반 자동 생성
+- `draft`
+  - `true`면 archive/route에서 제외
+  - 초안 저장용으로 사용
+- `featured`
+  - `true`면 이후 홈/아카이브 강조 영역 후보로 사용
+- `series`
+  - 같은 시리즈 글을 묶는 문자열
+  - 예: `React Architecture Deep Dive`
 
 ---
 

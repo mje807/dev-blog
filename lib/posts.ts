@@ -14,16 +14,23 @@ interface PostIndex {
   postsByCategory: Record<string, PostSummary[]>;
   categoryCounts: Record<string, number>;
   slugs: { category: CategoryKey; slug: string }[];
+  featuredPosts: PostSummary[];
+}
+
+function sortPosts(posts: PostSummary[]): PostSummary[] {
+  return [...posts].sort((a, b) => {
+    if (a.date < b.date) return 1;
+    if (a.date > b.date) return -1;
+    return 0;
+  });
 }
 
 const buildPostIndex = cache((): PostIndex => {
-  const allPosts = readAllPostFiles()
-    .map(normalizePostSummary)
-    .sort((a, b) => {
-      if (a.date < b.date) return 1;
-      if (a.date > b.date) return -1;
-      return 0;
-    });
+  const allPosts = sortPosts(
+    readAllPostFiles()
+      .map(normalizePostSummary)
+      .filter((post) => !post.draft),
+  );
 
   const postsByCategory: Record<string, PostSummary[]> = {};
   const categoryCounts: Record<string, number> = {};
@@ -41,7 +48,10 @@ const buildPostIndex = cache((): PostIndex => {
     allPosts,
     postsByCategory,
     categoryCounts,
-    slugs: listAllSlugs(),
+    slugs: listAllSlugs().filter(({ category, slug }) => {
+      return allPosts.some((post) => post.category === category && post.slug === slug);
+    }),
+    featuredPosts: allPosts.filter((post) => post.featured),
   };
 });
 
@@ -57,6 +67,10 @@ export const getCategoryCounts = cache((): Record<string, number> => {
   return buildPostIndex().categoryCounts;
 });
 
+export const getFeaturedPosts = cache((): PostSummary[] => {
+  return buildPostIndex().featuredPosts;
+});
+
 export const getAllSlugs = cache(() => {
   return buildPostIndex().slugs;
 });
@@ -66,5 +80,51 @@ export const getPostContent = cache(async (category: string, slug: string): Prom
   if (!postFile) return null;
 
   const content = await renderMarkdownToHtml(postFile.rawContent);
-  return normalizePostDetail({ ...postFile, content });
+  const post = normalizePostDetail({ ...postFile, content });
+  return post.draft ? null : post;
+});
+
+export const getAdjacentPosts = cache((category: string, slug: string): { previous: PostSummary | null; next: PostSummary | null } => {
+  const posts = getPostsByCategory(category);
+  const index = posts.findIndex((post) => post.slug === slug);
+
+  if (index === -1) {
+    return { previous: null, next: null };
+  }
+
+  return {
+    previous: posts[index + 1] || null,
+    next: posts[index - 1] || null,
+  };
+});
+
+export const getRelatedPosts = cache((category: string, slug: string, limit = 3): PostSummary[] => {
+  const current = getPostsByCategory(category).find((post) => post.slug === slug);
+  if (!current) return [];
+
+  const related = getAllPosts()
+    .filter((post) => !(post.category === current.category && post.slug === current.slug))
+    .map((post) => {
+      const sharedTags = post.tags.filter((tag) => current.tags.includes(tag)).length;
+      const sameCategoryBonus = post.category === current.category ? 2 : 0;
+      const sameSeriesBonus = current.series && post.series === current.series ? 3 : 0;
+      return {
+        post,
+        score: sharedTags + sameCategoryBonus + sameSeriesBonus,
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || (a.post.date < b.post.date ? 1 : -1))
+    .slice(0, limit)
+    .map((entry) => entry.post);
+
+  if (related.length >= limit) {
+    return related;
+  }
+
+  const fallback = getPostsByCategory(category)
+    .filter((post) => post.slug !== slug)
+    .slice(0, limit - related.length);
+
+  return [...related, ...fallback.filter((post) => !related.some((item) => item.slug === post.slug && item.category === post.category))];
 });
