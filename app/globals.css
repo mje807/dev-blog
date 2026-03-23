@@ -68,17 +68,38 @@
 .quick-view-card li { margin: 6px 0; }
 .quick-hint { margin-top: 14px; font-size: 12px; color: var(--text-muted); }
 .diagram-card {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: #121a27;
+  border: 1px solid rgba(99, 179, 237, 0.24);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgba(18, 26, 39, 0.98), rgba(15, 20, 31, 0.98));
   padding: 14px;
   margin: 20px 0;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
 }
 .diagram-label {
   font-size: 12px;
   color: #9cc7ec;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.mermaid-rendered,
+.diagram-card svg {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+}
+.diagram-card :where(svg text, svg tspan, svg foreignObject, svg span, svg div) {
+  color: #e2e8f0;
+  fill: #e2e8f0;
+}
+.diagram-card .node rect,
+.diagram-card .node circle,
+.diagram-card .node ellipse,
+.diagram-card .node polygon,
+.diagram-card .node path {
+  stroke-width: 1.5px;
 }
 .featured-hero {
   background: linear-gradient(135deg, rgba(99, 179, 237, 0.10), rgba(99, 179, 237, 0.03) 55%, rgba(22, 27, 39, 0.95));
