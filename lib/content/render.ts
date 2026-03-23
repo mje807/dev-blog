@@ -1,6 +1,7 @@
 import { remark } from 'remark';
 import remarkGfm from 'remark-gfm';
 import remarkRehype from 'remark-rehype';
+import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import rehypeStringify from 'rehype-stringify';
 import type { Schema } from 'hast-util-sanitize';
@@ -77,6 +78,7 @@ export async function renderMarkdownToHtml(markdown: string): Promise<string> {
     .use(remarkGfm)
     .use(remarkMermaidBlocks)
     .use(remarkRehype, { allowDangerousHtml: true })
+    .use(rehypeRaw)
     .use(rehypeSanitize, sanitizeSchema)
     .use(rehypeStringify)
     .process(markdown);

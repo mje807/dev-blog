@@ -10,12 +10,11 @@ describe('markdown render sanitize', () => {
     expect(html).toContain('<code class="language-ts">');
   });
 
-  it('drops raw html payloads under the conservative sanitize policy', async () => {
+  it('sanitizes raw html payloads while preserving safe links', async () => {
     const html = await renderMarkdownToHtml('<script>alert(1)</script>\n\n<a href="/x" onclick="alert(1)">link</a>');
 
     expect(html).not.toContain('<script>');
     expect(html).not.toContain('onclick=');
-    expect(html).not.toContain('<a href="/x">link</a>');
-    expect(html).toContain('<p>link</p>');
+    expect(html).toContain('<a href="/x">link</a>');
   });
 });
