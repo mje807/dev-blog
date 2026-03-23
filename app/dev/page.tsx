@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { getAllPosts, getCategoryCounts, getFeaturedPosts, CATEGORIES } from '@/lib/posts';
 import PostCard from '@/components/PostCard';
+import FeaturedHero from '@/components/FeaturedHero';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
 import EmptyState from '@/components/ui/EmptyState';
@@ -12,7 +13,9 @@ export const metadata = {
 
 export default function DevPage() {
   const allPosts = getAllPosts();
-  const featuredPosts = getFeaturedPosts().slice(0, 3);
+  const featuredPosts = getFeaturedPosts().slice(0, 4);
+  const heroPost = featuredPosts[0];
+  const supportingFeaturedPosts = featuredPosts.slice(1);
   const categoryCounts = getCategoryCounts();
   const recent = allPosts.filter((post) => !post.featured).slice(0, 6);
 
@@ -50,21 +53,31 @@ export default function DevPage() {
         </div>
       </section>
 
-      {featuredPosts.length > 0 && (
-        <section>
-          <div className="flex items-center justify-between mb-5">
-            <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
-              Featured Posts
-            </h2>
+      {heroPost && (
+        <section className="space-y-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
+                Featured Picks
+              </h2>
+              <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
+                지금 가장 먼저 읽기를 권하는 글을 상단에 배치했습니다.
+              </p>
+            </div>
             <Link href="/blog" className="text-sm" style={{ color: 'var(--accent)' }}>
               Dev Archive 전체 보기 →
             </Link>
           </div>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {featuredPosts.map((post, index) => (
-              <PostCard key={`${post.category}-${post.slug}`} post={post} featured={index === 0} />
-            ))}
-          </div>
+
+          <FeaturedHero post={heroPost} />
+
+          {supportingFeaturedPosts.length > 0 && (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {supportingFeaturedPosts.map((post) => (
+                <PostCard key={`${post.category}-${post.slug}`} post={post} />
+              ))}
+            </div>
+          )}
         </section>
       )}
 

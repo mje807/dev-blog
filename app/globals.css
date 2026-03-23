@@ -80,6 +80,23 @@
   margin-bottom: 8px;
   font-weight: 600;
 }
+.featured-hero {
+  background: linear-gradient(135deg, rgba(99, 179, 237, 0.10), rgba(99, 179, 237, 0.03) 55%, rgba(22, 27, 39, 0.95));
+  border-color: rgba(99, 179, 237, 0.35);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.18);
+}
+.featured-hero:hover {
+  border-color: var(--accent);
+}
+.featured-hero-badge {
+  background: rgba(99, 179, 237, 0.14);
+  color: #d6ecff;
+  border: 1px solid rgba(99, 179, 237, 0.35);
+}
+.featured-hero-tag {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-muted);
+}
 
 @layer base {
   :root,
