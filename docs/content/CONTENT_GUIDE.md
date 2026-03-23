@@ -137,6 +137,11 @@ series: React Architecture Deep Dive
 
 ---
 
+## 바로 시작할 때 참고할 문서
+- 포스트 기본 템플릿: `docs/content/POST_TEMPLATE.md`
+- 시리즈 템플릿: `docs/content/SERIES_TEMPLATE.md`
+- seed 추천 순서: `docs/content/CONTENT_SEED_PLAN.md`
+
 ## 메모
 - 이번 라운드는 **콘텐츠 양보다 구조 안정화**가 우선입니다.
 - invest 관련 본격 확장은 아직 범위 밖입니다.
