@@ -46,7 +46,6 @@ const sanitizeSchema: Schema = {
     div: [
       ...(defaultSchema.attributes?.div || []),
       'className',
-      'data-mermaid',
       'data-diagram-label',
     ],
   },
@@ -59,7 +58,7 @@ function remarkMermaidBlocks() {
 
       parent.children[index] = {
         type: 'html',
-        value: `<div class="diagram-source" data-diagram-label="Architecture Diagram" data-mermaid="${escapeHtmlAttribute(node.value || '')}"></div>`,
+        value: `<div class="diagram-source" data-diagram-label="Architecture Diagram">${escapeHtmlAttribute(node.value || '')}</div>`,
       };
     });
   };

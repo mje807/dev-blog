@@ -49,7 +49,7 @@ export default function BlogContent({ html }: BlogContentProps) {
     const renderMermaid = async () => {
       if (!containerRef.current || mode !== 'deep') return;
 
-      const mermaidSources = containerRef.current.querySelectorAll('[data-mermaid]');
+      const mermaidSources = containerRef.current.querySelectorAll('.diagram-source');
       if (mermaidSources.length === 0) return;
 
       const { default: mermaid } = await import('mermaid');
@@ -64,7 +64,7 @@ export default function BlogContent({ html }: BlogContentProps) {
       for (const source of mermaidSources) {
         if (source.getAttribute('data-mermaid-processed') === 'true') continue;
 
-        const graphDefinition = source.getAttribute('data-mermaid')?.trim();
+        const graphDefinition = source.textContent?.trim();
         if (!graphDefinition) continue;
 
         const card = document.createElement('div');
