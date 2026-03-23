@@ -49,46 +49,17 @@ export default function BlogContent({ html }: BlogContentProps) {
     const renderMermaid = async () => {
       if (!containerRef.current || mode !== 'deep') return;
 
-      const mermaidSources = containerRef.current.querySelectorAll('.diagram-source');
-      if (mermaidSources.length === 0) return;
+      const mermaidBlocks = containerRef.current.querySelectorAll<HTMLElement>('pre.mermaid');
+      if (mermaidBlocks.length === 0) return;
 
       const { default: mermaid } = await import('mermaid');
-
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: 'strict',
         theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
       });
 
-      let index = 0;
-      for (const source of mermaidSources) {
-        if (source.getAttribute('data-mermaid-processed') === 'true') continue;
-
-        const graphDefinition = source.textContent?.trim();
-        if (!graphDefinition) continue;
-
-        const card = document.createElement('div');
-        card.className = 'diagram-card';
-
-        const label = document.createElement('div');
-        label.className = 'diagram-label';
-        label.textContent = source.getAttribute('data-diagram-label') || 'Architecture Diagram';
-
-        const wrapper = document.createElement('div');
-        wrapper.className = 'mermaid';
-        wrapper.textContent = graphDefinition;
-
-        card.appendChild(label);
-        card.appendChild(wrapper);
-
-        source.replaceWith(card);
-        source.setAttribute('data-mermaid-processed', 'true');
-        index++;
-      }
-
-      if (index > 0) {
-        await mermaid.run({ nodes: containerRef.current.querySelectorAll('.mermaid') });
-      }
+      await mermaid.run({ nodes: mermaidBlocks });
     };
 
     renderMermaid().catch((err) => {
@@ -148,11 +119,7 @@ export default function BlogContent({ html }: BlogContentProps) {
           <p className="quick-hint">상세 분석과 다이어그램은 ‘깊게 읽기’에서 볼 수 있습니다.</p>
         </section>
       ) : (
-        <div
-          ref={containerRef}
-          className="prose"
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
+        <div ref={containerRef} className="prose" dangerouslySetInnerHTML={{ __html: html }} />
       )}
     </div>
   );
