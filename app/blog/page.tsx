@@ -1,9 +1,10 @@
 import Link from 'next/link';
-import { getAllPosts, getCategoryCounts, CATEGORIES } from '@/lib/posts';
+import { getAllPosts, getCategoryCounts, getSeriesGroups, CATEGORIES } from '@/lib/posts';
 import BlogPostBrowser from '@/components/BlogPostBrowser';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
 import EmptyState from '@/components/ui/EmptyState';
+import SeriesCard from '@/components/SeriesCard';
 
 export const metadata = {
   title: 'Dev Archive',
@@ -13,6 +14,7 @@ export const metadata = {
 export default function BlogPage() {
   const posts = getAllPosts();
   const categoryCounts = getCategoryCounts();
+  const seriesGroups = getSeriesGroups().slice(0, 3);
 
   return (
     <div>
@@ -49,6 +51,26 @@ export default function BlogPage() {
         })}
       </div>
       </SectionCard>
+
+      {seriesGroups.length > 0 && (
+        <SectionCard className="mb-8">
+          <div className="flex items-center justify-between mb-5">
+            <div>
+              <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
+                Featured Series
+              </h2>
+              <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
+                여러 글로 이어 읽기 좋은 시리즈를 먼저 모았습니다.
+              </p>
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {seriesGroups.map((series) => (
+              <SeriesCard key={series.name} series={series} />
+            ))}
+          </div>
+        </SectionCard>
+      )}
 
       <SectionCard>
         {posts.length === 0 ? (
