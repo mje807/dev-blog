@@ -1,6 +1,8 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import parse, { domToReact, type HTMLReactParserOptions, Element as DomElement } from 'html-react-parser';
+import MermaidDiagram from '@/components/MermaidDiagram';
 
 interface BlogContentProps {
   html: string;
@@ -13,9 +15,7 @@ interface QuickView {
 }
 
 export default function BlogContent({ html }: BlogContentProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<'deep' | 'quick'>('deep');
-
   const [quickView, setQuickView] = useState<QuickView>({ intro: '', sections: [], bullets: [] });
 
   useEffect(() => {
@@ -45,56 +45,35 @@ export default function BlogContent({ html }: BlogContentProps) {
     });
   }, [html]);
 
-  useEffect(() => {
-    const renderMermaid = async () => {
-      if (!containerRef.current || mode !== 'deep') return;
+  const deepContent = useMemo(() => {
+    const options: HTMLReactParserOptions = {
+      replace: (domNode) => {
+        if (!(domNode instanceof DomElement)) return;
 
-      const mermaidBlocks = containerRef.current.querySelectorAll<HTMLElement>('pre.mermaid');
-      if (mermaidBlocks.length === 0) return;
+        if (domNode.name === 'pre' && domNode.attribs?.class === 'mermaid') {
+          const code = domNode.children
+            .map((child: any) => ('data' in child ? child.data : ''))
+            .join('')
+            .trim();
 
-      const { default: mermaid } = await import('mermaid');
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: 'strict',
-        theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
-      });
-
-      let index = 0;
-      for (const block of mermaidBlocks) {
-        if (block.getAttribute('data-mermaid-processed') === 'true') continue;
-
-        const graphDefinition = block.textContent?.trim();
-        if (!graphDefinition) continue;
-
-        try {
-          const renderId = `mermaid-${index++}`;
-          const { svg } = await mermaid.render(renderId, graphDefinition);
-
-          const card = document.createElement('div');
-          card.className = 'diagram-card';
-
-          const label = document.createElement('div');
-          label.className = 'diagram-label';
-          label.textContent = 'Architecture Diagram';
-
-          const wrapper = document.createElement('div');
-          wrapper.className = 'mermaid-rendered';
-          wrapper.innerHTML = svg;
-
-          card.appendChild(label);
-          card.appendChild(wrapper);
-          block.replaceWith(card);
-          block.setAttribute('data-mermaid-processed', 'true');
-        } catch (error) {
-          console.error('Mermaid block render failed:', error);
+          if (!code) return null;
+          return <MermaidDiagram code={code} />;
         }
-      }
+
+        if (domNode.attribs) {
+          const className = domNode.attribs.class;
+          if (className) {
+            domNode.attribs.className = className;
+            delete domNode.attribs.class;
+          }
+        }
+
+        return undefined;
+      },
     };
 
-    renderMermaid().catch((err) => {
-      console.error('Mermaid rendering failed:', err);
-    });
-  }, [html, mode]);
+    return parse(html, options);
+  }, [html]);
 
   return (
     <div>
@@ -148,7 +127,7 @@ export default function BlogContent({ html }: BlogContentProps) {
           <p className="quick-hint">상세 분석과 다이어그램은 ‘깊게 읽기’에서 볼 수 있습니다.</p>
         </section>
       ) : (
-        <div ref={containerRef} className="prose" dangerouslySetInnerHTML={{ __html: html }} />
+        <div className="prose">{deepContent}</div>
       )}
     </div>
   );
