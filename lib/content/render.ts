@@ -4,6 +4,7 @@ import remarkRehype from 'remark-rehype';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import rehypeStringify from 'rehype-stringify';
 import type { Schema } from 'hast-util-sanitize';
+import { visit } from 'unist-util-visit';
 
 const sanitizeSchema: Schema = {
   ...defaultSchema,
@@ -26,6 +27,7 @@ const sanitizeSchema: Schema = {
     'td',
     'del',
     'hr',
+    'div',
   ],
   attributes: {
     ...defaultSchema.attributes,
@@ -40,13 +42,41 @@ const sanitizeSchema: Schema = {
       'height',
       'loading',
     ],
+    div: [
+      ...(defaultSchema.attributes?.div || []),
+      'className',
+      'data-mermaid',
+      'data-diagram-label',
+    ],
   },
 };
+
+function remarkMermaidBlocks() {
+  return (tree: any) => {
+    visit(tree, 'code', (node: any, index: number | undefined, parent: any) => {
+      if (!parent || index === undefined || node.lang !== 'mermaid') return;
+
+      parent.children[index] = {
+        type: 'html',
+        value: `<div class="diagram-source" data-diagram-label="Architecture Diagram" data-mermaid="${escapeHtmlAttribute(node.value || '')}"></div>`,
+      };
+    });
+  };
+}
+
+function escapeHtmlAttribute(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 export async function renderMarkdownToHtml(markdown: string): Promise<string> {
   const processedContent = await remark()
     .use(remarkGfm)
-    .use(remarkRehype)
+    .use(remarkMermaidBlocks)
+    .use(remarkRehype, { allowDangerousHtml: true })
     .use(rehypeSanitize, sanitizeSchema)
     .use(rehypeStringify)
     .process(markdown);

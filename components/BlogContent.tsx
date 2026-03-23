@@ -49,8 +49,8 @@ export default function BlogContent({ html }: BlogContentProps) {
     const renderMermaid = async () => {
       if (!containerRef.current || mode !== 'deep') return;
 
-      const mermaidBlocks = containerRef.current.querySelectorAll('pre > code.language-mermaid');
-      if (mermaidBlocks.length === 0) return;
+      const mermaidSources = containerRef.current.querySelectorAll('[data-mermaid]');
+      if (mermaidSources.length === 0) return;
 
       const { default: mermaid } = await import('mermaid');
 
@@ -61,11 +61,10 @@ export default function BlogContent({ html }: BlogContentProps) {
       });
 
       let index = 0;
-      for (const block of mermaidBlocks) {
-        const pre = block.parentElement;
-        if (!pre || pre.getAttribute('data-mermaid-processed') === 'true') continue;
+      for (const source of mermaidSources) {
+        if (source.getAttribute('data-mermaid-processed') === 'true') continue;
 
-        const graphDefinition = block.textContent?.trim();
+        const graphDefinition = source.getAttribute('data-mermaid')?.trim();
         if (!graphDefinition) continue;
 
         const card = document.createElement('div');
@@ -73,7 +72,7 @@ export default function BlogContent({ html }: BlogContentProps) {
 
         const label = document.createElement('div');
         label.className = 'diagram-label';
-        label.textContent = 'Architecture Diagram';
+        label.textContent = source.getAttribute('data-diagram-label') || 'Architecture Diagram';
 
         const wrapper = document.createElement('div');
         wrapper.className = 'mermaid';
@@ -82,8 +81,8 @@ export default function BlogContent({ html }: BlogContentProps) {
         card.appendChild(label);
         card.appendChild(wrapper);
 
-        pre.replaceWith(card);
-        pre.setAttribute('data-mermaid-processed', 'true');
+        source.replaceWith(card);
+        source.setAttribute('data-mermaid-processed', 'true');
         index++;
       }
 
