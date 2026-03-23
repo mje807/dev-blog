@@ -9,12 +9,19 @@ import { normalizePostDetail, normalizePostSummary } from '@/lib/content/transfo
 export { CATEGORIES };
 export type Post = PostSummary;
 
+export interface SeriesGroup {
+  name: string;
+  posts: PostSummary[];
+  categories: string[];
+}
+
 interface PostIndex {
   allPosts: PostSummary[];
   postsByCategory: Record<string, PostSummary[]>;
   categoryCounts: Record<string, number>;
   slugs: { category: CategoryKey; slug: string }[];
   featuredPosts: PostSummary[];
+  series: Record<string, SeriesGroup>;
 }
 
 function sortPosts(posts: PostSummary[]): PostSummary[] {
@@ -28,6 +35,14 @@ function sortPosts(posts: PostSummary[]): PostSummary[] {
   });
 }
 
+function toSeriesSlug(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9가-힣]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 const buildPostIndex = cache((): PostIndex => {
   const allPosts = sortPosts(
     readAllPostFiles()
@@ -37,6 +52,7 @@ const buildPostIndex = cache((): PostIndex => {
 
   const postsByCategory: Record<string, PostSummary[]> = {};
   const categoryCounts: Record<string, number> = {};
+  const series: Record<string, SeriesGroup> = {};
 
   for (const post of allPosts) {
     if (!postsByCategory[post.category]) {
@@ -45,6 +61,25 @@ const buildPostIndex = cache((): PostIndex => {
 
     postsByCategory[post.category].push(post);
     categoryCounts[post.category] = (categoryCounts[post.category] || 0) + 1;
+
+    if (post.series) {
+      const key = toSeriesSlug(post.series);
+      if (!series[key]) {
+        series[key] = {
+          name: post.series,
+          posts: [],
+          categories: [],
+        };
+      }
+      series[key].posts.push(post);
+      if (!series[key].categories.includes(post.category)) {
+        series[key].categories.push(post.category);
+      }
+    }
+  }
+
+  for (const key of Object.keys(series)) {
+    series[key].posts = sortPosts(series[key].posts);
   }
 
   return {
@@ -55,6 +90,7 @@ const buildPostIndex = cache((): PostIndex => {
       return allPosts.some((post) => post.category === category && post.slug === slug);
     }),
     featuredPosts: allPosts.filter((post) => post.featured),
+    series,
   };
 });
 
@@ -72,6 +108,20 @@ export const getCategoryCounts = cache((): Record<string, number> => {
 
 export const getFeaturedPosts = cache((): PostSummary[] => {
   return buildPostIndex().featuredPosts;
+});
+
+export const getSeriesGroups = cache((): SeriesGroup[] => {
+  return Object.entries(buildPostIndex().series)
+    .map(([, group]) => group)
+    .sort((a, b) => b.posts.length - a.posts.length || a.name.localeCompare(b.name, 'ko'));
+});
+
+export const getSeriesSlugs = cache(() => {
+  return Object.keys(buildPostIndex().series).map((slug) => ({ slug }));
+});
+
+export const getSeriesGroupBySlug = cache((slug: string): SeriesGroup | null => {
+  return buildPostIndex().series[slug] || null;
 });
 
 export const getAllSlugs = cache(() => {
@@ -99,6 +149,14 @@ export const getAdjacentPosts = cache((category: string, slug: string): { previo
     previous: posts[index + 1] || null,
     next: posts[index - 1] || null,
   };
+});
+
+export const getSeriesPostsForPost = cache((category: string, slug: string): PostSummary[] => {
+  const current = getPostsByCategory(category).find((post) => post.slug === slug);
+  if (!current?.series) return [];
+
+  const key = toSeriesSlug(current.series);
+  return (buildPostIndex().series[key]?.posts || []).filter((post) => !(post.category === category && post.slug === slug));
 });
 
 export const getRelatedPosts = cache((category: string, slug: string, limit = 3): PostSummary[] => {

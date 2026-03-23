@@ -1,6 +1,6 @@
 import { notFound } from 'next/navigation';
 import Link from 'next/link';
-import { getPostContent, getAllSlugs, CATEGORIES, getAdjacentPosts, getRelatedPosts } from '@/lib/posts';
+import { getPostContent, getAllSlugs, CATEGORIES, getAdjacentPosts, getRelatedPosts, getSeriesPostsForPost } from '@/lib/posts';
 import BlogContent from '@/components/BlogContent';
 import PageHeader from '@/components/ui/PageHeader';
 import SectionCard from '@/components/ui/SectionCard';
@@ -32,6 +32,14 @@ export default async function PostPage({ params }: Props) {
   const categoryMeta = CATEGORIES[post.category];
   const adjacent = getAdjacentPosts(post.category, post.slug);
   const relatedPosts = getRelatedPosts(post.category, post.slug, 3);
+  const seriesPosts = getSeriesPostsForPost(post.category, post.slug);
+  const seriesSlug = post.series
+    ? post.series
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9가-힣]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+    : null;
 
   return (
     <article className="max-w-3xl mx-auto">
@@ -77,7 +85,43 @@ export default async function PostPage({ params }: Props) {
         </div>
       )}
 
+      {post.series && (
+        <SectionCard className="mb-8">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-[0.16em] mb-2" style={{ color: 'var(--accent)' }}>
+                Series
+              </div>
+              <div className="font-semibold" style={{ color: 'var(--text)' }}>{post.series}</div>
+              <div className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
+                이 글은 시리즈 흐름 안에 포함되어 있습니다.
+              </div>
+            </div>
+            {seriesSlug && (
+              <Link href={`/blog/series/${seriesSlug}`} className="px-4 py-2 rounded-lg text-sm border" style={{ borderColor: 'var(--border)', color: 'var(--text-muted)' }}>
+                시리즈 전체 보기
+              </Link>
+            )}
+          </div>
+        </SectionCard>
+      )}
+
       <BlogContent html={post.content || ''} />
+
+      {seriesPosts.length > 0 && (
+        <section className="mt-16">
+          <h2 className="text-lg font-bold mb-4" style={{ color: 'var(--text)' }}>같은 시리즈</h2>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {seriesPosts.slice(0, 4).map((seriesPost) => (
+              <PostLinkCard
+                key={`${seriesPost.category}-${seriesPost.slug}`}
+                post={seriesPost}
+                label="시리즈 글"
+              />
+            ))}
+          </div>
+        </section>
+      )}
 
       {(adjacent.previous || adjacent.next) && (
         <section className="mt-16">
