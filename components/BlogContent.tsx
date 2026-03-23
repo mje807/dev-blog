@@ -59,7 +59,36 @@ export default function BlogContent({ html }: BlogContentProps) {
         theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
       });
 
-      await mermaid.run({ nodes: mermaidBlocks });
+      let index = 0;
+      for (const block of mermaidBlocks) {
+        if (block.getAttribute('data-mermaid-processed') === 'true') continue;
+
+        const graphDefinition = block.textContent?.trim();
+        if (!graphDefinition) continue;
+
+        try {
+          const renderId = `mermaid-${index++}`;
+          const { svg } = await mermaid.render(renderId, graphDefinition);
+
+          const card = document.createElement('div');
+          card.className = 'diagram-card';
+
+          const label = document.createElement('div');
+          label.className = 'diagram-label';
+          label.textContent = 'Architecture Diagram';
+
+          const wrapper = document.createElement('div');
+          wrapper.className = 'mermaid-rendered';
+          wrapper.innerHTML = svg;
+
+          card.appendChild(label);
+          card.appendChild(wrapper);
+          block.replaceWith(card);
+          block.setAttribute('data-mermaid-processed', 'true');
+        } catch (error) {
+          console.error('Mermaid block render failed:', error);
+        }
+      }
     };
 
     renderMermaid().catch((err) => {
