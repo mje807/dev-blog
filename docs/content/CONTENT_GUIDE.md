@@ -22,6 +22,7 @@
 ## 카테고리 규칙
 현재 허용 카테고리:
 - `react`
+- `compiler`
 - `frontend-architecture`
 - `software-engineering`
 - `ai-skill-design`
@@ -30,6 +31,7 @@
 
 ### 선택 기준
 - `react`: React 내부 동작, 렌더링, SSR, hydration, hooks, router 등
+- `compiler`: 파싱, AST, 정적 분석, IR, 최적화 패스, 타입 시스템, 컴파일러 구조
 - `frontend-architecture`: MFE, module federation, 계층 구조, UI architecture
 - `software-engineering`: 운영 경험, 품질, 테스트, 설계 원칙, 협업 방식
 - `ai-skill-design`: 에이전트/스킬 설계, 프롬프트 운영, 자동화 구조
