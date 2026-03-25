@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import parse, { domToReact, type HTMLReactParserOptions, Element as DomElement } from 'html-react-parser';
+import parse, { type HTMLReactParserOptions } from 'html-react-parser';
+import type { Element as DomElement, DataNode } from 'domhandler';
 import MermaidDiagram from '@/components/MermaidDiagram';
 
 interface BlogContentProps {
@@ -48,11 +49,15 @@ export default function BlogContent({ html }: BlogContentProps) {
   const deepContent = useMemo(() => {
     const options: HTMLReactParserOptions = {
       replace: (domNode) => {
-        if (!(domNode instanceof DomElement)) return;
+        if (domNode.type !== 'tag') return undefined;
 
-        if (domNode.name === 'pre' && domNode.attribs?.class === 'mermaid') {
-          const code = domNode.children
-            .map((child: any) => ('data' in child ? child.data : ''))
+        const element = domNode as DomElement;
+        const classAttr = element.attribs?.class || element.attribs?.className || '';
+        const classNames = classAttr.split(/\s+/).filter(Boolean);
+
+        if (element.name === 'pre' && classNames.includes('mermaid')) {
+          const code = (element.children || [])
+            .map((child) => ('data' in child ? (child as DataNode).data : ''))
             .join('')
             .trim();
 
@@ -60,12 +65,9 @@ export default function BlogContent({ html }: BlogContentProps) {
           return <MermaidDiagram code={code} />;
         }
 
-        if (domNode.attribs) {
-          const className = domNode.attribs.class;
-          if (className) {
-            domNode.attribs.className = className;
-            delete domNode.attribs.class;
-          }
+        if (element.attribs && element.attribs.class) {
+          element.attribs.className = element.attribs.class;
+          delete element.attribs.class;
         }
 
         return undefined;
